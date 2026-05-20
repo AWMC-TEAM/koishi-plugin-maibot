@@ -4,11 +4,11 @@
 
 ## 公共 API 与文档链接
 
-- **申请 API / 令牌**：[https://api.awmc.cc](https://api.awmc.cc)
-- **购买额度**：[https://store.awmc.cc](https://store.awmc.cc)
-- **开放接口与计费说明（在线）**：[https://wiki.awmc.cc/dev/awmc-api](https://wiki.awmc.cc/dev/awmc-api) · 仓库内 [`awmc-api.md`](./awmc-api.md) 为摘要（默认网关 `https://api.awmc.cc`）
+- **申请 API / 令牌**：[https://api.awmc.team](https://api.awmc.team)
+- **购买额度**：[https://store.awmc.team](https://store.awmc.team)
+- **开放接口与计费说明（在线）**：[https://wiki.awmc.team/dev/awmc-api](https://wiki.awmc.team/dev/awmc-api) · 仓库内 [`awmc-api.md`](./awmc-api.md) 为摘要（默认网关 `https://api.awmc.team`）
 
-使用公共网关时，在插件配置中将 **apiMode** 设为 `public`，填写 **publicGatewayToken**，并将 **apiBaseURL** 设为 `https://api.awmc.cc`（或提供方给出的网关根地址）。无需配置 **machineInfo**、**turnstileToken**。若接口返回 **403**，多为账户 Token 余额不足，请到 [store.awmc.cc](https://store.awmc.cc) 充值后再试。
+使用公共网关时，在插件配置中将 **apiMode** 设为 `public`，填写 **publicGatewayToken**，并将 **apiBaseURL** 设为 `https://api.awmc.team`（或提供方给出的网关根地址）。无需配置 **machineInfo**、**turnstileToken**。若接口返回 **403**，多为账户 Token 余额不足，请到 [store.awmc.team](https://store.awmc.team) 充值后再试。
 
 更完整的安装步骤、进阶功能与排错说明请见 **项目 Wiki**（GitHub 仓库主页文档区）。
 
@@ -40,8 +40,8 @@ npm install koishi-plugin-maibot
 plugins:
   maibot:
     apiMode: public
-    apiBaseURL: https://api.awmc.cc
-    publicGatewayToken: <在 api.awmc.cc 获取的令牌>
+    apiBaseURL: https://api.awmc.team
+    publicGatewayToken: <在 api.awmc.team 获取的令牌>
 ```
 
 **自建 / 团队内部服务示例：**
@@ -100,7 +100,7 @@ plugins:
 
 本插件通过 HTTP 调用后端网关：
 
-- **apiMode: public** 时，使用网关的 **`/v1/...`** 路径，请求头携带 `Authorization: Bearer <令牌>`，详见 [Wiki 文档](https://wiki.awmc.cc/dev/awmc-api) 或 [`awmc-api.md`](./awmc-api.md)。
+- **apiMode: public** 时，使用网关的 **`/v1/...`** 路径，请求头携带 `Authorization: Bearer <令牌>`，详见 [Wiki 文档](https://wiki.awmc.team/dev/awmc-api) 或 [`awmc-api.md`](./awmc-api.md)。
 - **apiMode: team** 时，使用自建服务上既有路径（如 `/api/public/...` 等），与历史部署一致。
 
 ## 许可证

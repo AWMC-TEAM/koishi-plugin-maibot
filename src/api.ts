@@ -483,6 +483,150 @@ export class MaiBotAPI {
     return response.data
   }
 
+  /**
+   * 手动上传单曲成绩
+   * POST /api/private/upload_score_manual
+   * public: POST /v1/upload_score_manual
+   * 需要: qr_code, musicId, levelId, achievement, combo, sync, dxScore, rank
+   */
+  async uploadScoreManual(
+    qrText: string,
+    musicId: number,
+    levelId: number,
+    achievement: number,
+    combo: number,
+    sync: number,
+    dxScore: number,
+    rank: number,
+    playcount?: number,
+    iscover?: number,
+    isforce?: number,
+    detailmode?: number,
+  ): Promise<{
+    success: boolean
+    result?: {
+      returnCode: number
+      apiName: string
+    }
+    msg?: string
+  }> {
+    const path =
+      this.apiStyle === 'public' ? '/v1/upload_score_manual' : '/api/private/upload_score_manual'
+    const response = await this.client.post(path, {
+      qr_code: qrText,
+      musicId,
+      levelId,
+      achievement,
+      combo,
+      sync,
+      dxScore,
+      rank,
+      playcount: playcount ?? 1,
+      iscover: iscover ?? 0,
+      isforce: isforce ?? 0,
+      detailmode: detailmode ?? 0,
+    })
+    return response.data
+  }
+
+  /**
+   * 手动批量上传成绩
+   * POST /api/private/batch_upload_score_manual
+   * public: POST /v1/batch_upload_score_manual
+   * 需要: qr_code, musicId, level_range, combo, sync, dxScore
+   */
+  async batchUploadScoreManual(
+    qrText: string,
+    musicId: number,
+    levelRange: number[],
+    combo: number,
+    sync: number,
+    dxScore: number,
+  ): Promise<{
+    success: boolean
+    result?: {
+      returnCode: number
+      apiName: string
+    }
+    msg?: string
+  }> {
+    const path =
+      this.apiStyle === 'public'
+        ? '/v1/batch_upload_score_manual'
+        : '/api/private/batch_upload_score_manual'
+    const response = await this.client.post(path, {
+      qr_code: qrText,
+      musicId,
+      level_range: levelRange,
+      combo,
+      sync,
+      dxScore,
+    })
+    return response.data
+  }
+
+  /**
+   * 手动解锁单个物品
+   * POST /api/private/unlock_single_item_manual
+   * public: POST /v1/unlock_single_item_manual
+   * 需要: qr_code, item_id, item_kind, item_stock
+   */
+  async unlockSingleItemManual(
+    qrText: string,
+    itemId: number,
+    itemKind: number,
+    itemStock: number = 1,
+  ): Promise<{
+    success: boolean
+    result?: {
+      returnCode: number
+      apiName: string
+    }
+    msg?: string
+  }> {
+    const path =
+      this.apiStyle === 'public'
+        ? '/v1/unlock_single_item_manual'
+        : '/api/private/unlock_single_item_manual'
+    const response = await this.client.post(path, {
+      qr_code: qrText,
+      item_id: itemId,
+      item_kind: itemKind,
+      item_stock: itemStock,
+    })
+    return response.data
+  }
+
+  /**
+   * 手动解锁单首乐曲
+   * POST /api/private/unlock_music_manual
+   * public: POST /v1/unlock_music_manual
+   * 需要: qr_code, music_id, item_stock, remaster
+   */
+  async unlockMusicManual(
+    qrText: string,
+    musicId: number,
+    itemStock: number = 1,
+    remaster: number = 0,
+  ): Promise<{
+    success: boolean
+    result?: {
+      returnCode: number
+      apiName: string
+    }
+    msg?: string
+  }> {
+    const path =
+      this.apiStyle === 'public' ? '/v1/unlock_music_manual' : '/api/private/unlock_music_manual'
+    const response = await this.client.post(path, {
+      qr_code: qrText,
+      music_id: musicId,
+      item_stock: itemStock,
+      remaster,
+    })
+    return response.data
+  }
+
   // ========== 以下为旧API，已不再支持，保留用于兼容性 ==========
 
   /**

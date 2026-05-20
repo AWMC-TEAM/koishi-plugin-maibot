@@ -45,7 +45,7 @@ export interface Config {
   apiBaseURL: string
   /** team：自建/团队内部网关；public：AWMC 公共网关（/v1 + Bearer，见 wiki） */
   apiMode?: 'team' | 'public'
-  /** apiMode 为 public 时必填，登录 https://api.awmc.cc 获取 gw_ / JWT 令牌 */
+  /** apiMode 为 public 时必填，登录 https://api.awmc.team 获取 gw_ / JWT 令牌 */
   publicGatewayToken?: string
   apiTimeout?: number
   apiRetryCount?: number
@@ -116,14 +116,14 @@ export const Config: Schema<Config> = Schema.object({
   ])
     .default('team')
     .description(
-      'API 来源：public=公共网关（须填 publicGatewayToken，apiBaseURL 一般为 https://api.awmc.cc ）；team=内部服务（须填 machineInfo、turnstileToken）。',
+      'API 来源：public=公共网关（须填 publicGatewayToken，apiBaseURL 一般为 https://api.awmc.team ）；team=内部服务（须填 machineInfo、turnstileToken）。',
     ),
   publicGatewayToken: Schema.string()
     .required(false)
-    .description('公共网关令牌（Bearer / gw_…，勿泄露）。申请 https://api.awmc.cc · 购买额度 https://store.awmc.cc'),
+    .description('公共网关令牌（Bearer / gw_…，勿泄露）。申请 https://api.awmc.team · 购买额度 https://store.awmc.team'),
   apiBaseURL: Schema.string()
     .default('http://localhost:5566')
-    .description('API 根地址。public 模式一般为 https://api.awmc.cc ；team 模式为自建服务地址'),
+    .description('API 根地址。public 模式一般为 https://api.awmc.team ；team 模式为自建服务地址'),
   apiTimeout: Schema.number().default(30000).description('API请求超时时间（毫秒）'),
   apiRetryCount: Schema.number().default(5).description('API请求重试次数（仅在 ECONNRESET 或 504 时生效）'),
   apiRetryDelay: Schema.number().default(1000).description('API请求重试间隔（毫秒）'),
@@ -245,7 +245,7 @@ export const Config: Schema<Config> = Schema.object({
     shopUrl: '',
   }),
 }).description(
-  '【公共 API】申请 https://api.awmc.cc',
+  '【公共 API】申请 https://api.awmc.team',
 )
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
@@ -522,6 +522,13 @@ async function promptYes(session: Session, message: string, timeout?: number): P
   }
 }
 
+const INTERACTIVE_CANCEL_HINT = '输入 00 取消'
+
+function isInteractiveCancel(input: string | undefined | null): boolean {
+  const t = (input ?? '').trim().toLowerCase()
+  return t === '00' || t === '取消' || t === 'cancel' || t === 'q'
+}
+
 const COLLECTION_TYPE_OPTIONS = [
   { label: '头像框', value: 1 },
   { label: '称号', value: 2 },
@@ -542,20 +549,19 @@ const COLLECTION_TYPE_OPTIONS = [
 
 async function promptCollectionType(session: Session, timeout = 60000): Promise<number | null> {
   const optionsText = COLLECTION_TYPE_OPTIONS.map(
-    (opt, idx) => `${idx + 1}. ${opt.label} (${opt.value})`
+    (opt, idx) => `${idx + 1}. ${opt.label}`
   ).join('\n')
   
   await session.send(
-    `请问你需要什么类型收藏品？\n\n${optionsText}\n\n请输入对应的数字（1-${COLLECTION_TYPE_OPTIONS.length}），或输入0取消`
+    `请问你需要什么类型收藏品？\n\n${optionsText}\n\n请输入对应的数字（1-${COLLECTION_TYPE_OPTIONS.length}），${INTERACTIVE_CANCEL_HINT}`
   )
   
   try {
     const answer = await session.prompt(timeout)
-    const choice = parseInt(answer?.trim() || '0', 10)
-    
-    if (choice === 0) {
+    if (isInteractiveCancel(answer)) {
       return null
     }
+    const choice = parseInt(answer?.trim() || '', 10)
     
     if (choice >= 1 && choice <= COLLECTION_TYPE_OPTIONS.length) {
       return COLLECTION_TYPE_OPTIONS[choice - 1].value
@@ -586,16 +592,37 @@ const FC_STATUS_OPTIONS = [
 const SYNC_STATUS_OPTIONS = [
   { label: '无', value: 0 },
   { label: 'Full Sync', value: 1 },
-  { label: 'Full Sync DX', value: 2 },
+  { label: 'Full Sync+', value: 2 },
+  { label: 'FullDX', value: 3 },
+  { label: 'FullDX+', value: 4 },
+  { label: 'SYNC', value: 5 },
+]
+
+const RANK_OPTIONS = [
+  { label: 'C', value: 7 },
+  { label: 'C+', value: 8 },
+  { label: 'B', value: 9 },
+  { label: 'B+', value: 10 },
+  { label: 'A', value: 11 },
+  { label: 'A+', value: 12 },
+  { label: 'AA', value: 13 },
+  { label: 'AA+', value: 14 },
+  { label: 'S', value: 15 },
+  { label: 'S+', value: 16 },
+  { label: 'SS', value: 17 },
+  { label: 'SS+', value: 18 },
+  { label: 'SSS', value: 19 },
+  { label: 'SSS+', value: 20 },
 ]
 
 interface ScoreData {
   musicId: number
-  level: number
+  levelId: number
   achievement: number
-  fcStatus: number
-  syncStatus: number
+  combo: number
+  sync: number
   dxScore: number
+  rank: number
 }
 
 async function promptScoreData(session: Session, timeout = 60000): Promise<ScoreData | null> {
@@ -604,10 +631,10 @@ async function promptScoreData(session: Session, timeout = 60000): Promise<Score
     await session.send(
       '请输入乐曲ID（数字）\n' +
       '如果不知道乐曲ID，请前往 https://maimai.lxns.net/songs 查询\n\n' +
-      '输入0取消操作'
+      INTERACTIVE_CANCEL_HINT
     )
     const musicIdInput = await session.prompt(timeout)
-    if (!musicIdInput || musicIdInput.trim() === '0') {
+    if (!musicIdInput || isInteractiveCancel(musicIdInput)) {
       return null
     }
     const musicId = parseInt(musicIdInput.trim(), 10)
@@ -616,102 +643,129 @@ async function promptScoreData(session: Session, timeout = 60000): Promise<Score
       return null
     }
 
-    // 2. 难度等级
-    const levelOptionsText = LEVEL_OPTIONS.map(
-      (opt, idx) => `${idx + 1}. ${opt.label} (${opt.value})`
+    // 2. 难度 (levelId: 0=Basic, 1=Advanced, 2=Expert, 3=Master, 4=Re:Master)
+    const LEVEL_ID_OPTIONS = [
+      { label: 'Basic', value: 0 },
+      { label: 'Advanced', value: 1 },
+      { label: 'Expert', value: 2 },
+      { label: 'Master', value: 3 },
+      { label: 'Re:Master', value: 4 },
+    ]
+    const levelOptionsText = LEVEL_ID_OPTIONS.map(
+      (opt, idx) => `${idx + 1}. ${opt.label}`
     ).join('\n')
     await session.send(
-      `请选择难度等级：\n\n${levelOptionsText}\n\n请输入对应的数字（1-${LEVEL_OPTIONS.length}），或输入0取消`
+      `请选择难度：\n\n${levelOptionsText}\n\n请输入对应的数字（1-${LEVEL_ID_OPTIONS.length}），${INTERACTIVE_CANCEL_HINT}`
     )
     const levelInput = await session.prompt(timeout)
-    const levelChoice = parseInt(levelInput?.trim() || '0', 10)
-    if (levelChoice === 0) {
+    if (isInteractiveCancel(levelInput)) {
       return null
     }
-    if (levelChoice < 1 || levelChoice > LEVEL_OPTIONS.length) {
+    const levelChoice = parseInt(levelInput?.trim() || '', 10)
+    if (levelChoice < 1 || levelChoice > LEVEL_ID_OPTIONS.length) {
       await session.send('❌ 无效的选择，操作已取消')
       return null
     }
-    const level = LEVEL_OPTIONS[levelChoice - 1].value
+    const levelId = LEVEL_ID_OPTIONS[levelChoice - 1].value
 
-    // 3. 达成率（achievement）
+    // 3. 成就值 (achievement: 0-1010000)
     await session.send(
-      '请输入达成率（整数，例如：1010000 表示 S+）\n' +
+      '请输入成就值（整数，0-1010000，例如：1005000 表示 100.5000%）\n' +
       '参考：\n' +
-      '  S+ = 1010000\n' +
-      '  S = 1007500\n' +
-      '  A+ = 1005000\n' +
-      '  A = 1000000\n\n' +
-      '输入0取消操作'
+      '  1010000 = SSS+ (101%)\n' +
+      '  1005000 = SSS (100.5%)\n' +
+      '  1000000 = SSS (100%)\n' +
+      '  995000  = S+\n' +
+      '  990000  = S\n\n' +
+      INTERACTIVE_CANCEL_HINT
     )
     const achievementInput = await session.prompt(timeout)
-    if (!achievementInput || achievementInput.trim() === '0') {
+    if (!achievementInput || isInteractiveCancel(achievementInput)) {
       return null
     }
     const achievement = parseInt(achievementInput.trim(), 10)
-    if (isNaN(achievement) || achievement < 0) {
-      await session.send('❌ 达成率必须是大于等于0的数字，操作已取消')
+    if (isNaN(achievement) || achievement < 0 || achievement > 1010000) {
+      await session.send('❌ 成就值必须在 0-1010000 之间，操作已取消')
       return null
     }
 
-    // 4. Full Combo状态
+    // 4. 连击状态 (combo: 0=无, 1=FC, 2=FC+, 3=AP, 4=AP+)
     const fcOptionsText = FC_STATUS_OPTIONS.map(
-      (opt, idx) => `${idx + 1}. ${opt.label} (${opt.value})`
+      (opt, idx) => `${idx + 1}. ${opt.label}`
     ).join('\n')
     await session.send(
-      `请选择Full Combo状态：\n\n${fcOptionsText}\n\n请输入对应的数字（1-${FC_STATUS_OPTIONS.length}），或输入0取消`
+      `请选择连击状态：\n\n${fcOptionsText}\n\n请输入对应的数字（1-${FC_STATUS_OPTIONS.length}），${INTERACTIVE_CANCEL_HINT}`
     )
     const fcInput = await session.prompt(timeout)
-    const fcChoice = parseInt(fcInput?.trim() || '0', 10)
-    if (fcChoice === 0) {
+    if (isInteractiveCancel(fcInput)) {
       return null
     }
+    const fcChoice = parseInt(fcInput?.trim() || '', 10)
     if (fcChoice < 1 || fcChoice > FC_STATUS_OPTIONS.length) {
       await session.send('❌ 无效的选择，操作已取消')
       return null
     }
-    const fcStatus = FC_STATUS_OPTIONS[fcChoice - 1].value
+    const combo = FC_STATUS_OPTIONS[fcChoice - 1].value
 
-    // 5. 同步状态
+    // 5. 同步状态 (sync: 0=无, 1=FS, 2=FS+, 3=FDX, 4=FDX+, 5=SYNC)
     const syncOptionsText = SYNC_STATUS_OPTIONS.map(
-      (opt, idx) => `${idx + 1}. ${opt.label} (${opt.value})`
+      (opt, idx) => `${idx + 1}. ${opt.label}`
     ).join('\n')
     await session.send(
-      `请选择同步状态：\n\n${syncOptionsText}\n\n请输入对应的数字（1-${SYNC_STATUS_OPTIONS.length}），或输入0取消`
+      `请选择同步状态：\n\n${syncOptionsText}\n\n请输入对应的数字（1-${SYNC_STATUS_OPTIONS.length}），${INTERACTIVE_CANCEL_HINT}`
     )
     const syncInput = await session.prompt(timeout)
-    const syncChoice = parseInt(syncInput?.trim() || '0', 10)
-    if (syncChoice === 0) {
+    if (isInteractiveCancel(syncInput)) {
       return null
     }
+    const syncChoice = parseInt(syncInput?.trim() || '', 10)
     if (syncChoice < 1 || syncChoice > SYNC_STATUS_OPTIONS.length) {
       await session.send('❌ 无效的选择，操作已取消')
       return null
     }
-    const syncStatus = SYNC_STATUS_OPTIONS[syncChoice - 1].value
+    const sync = SYNC_STATUS_OPTIONS[syncChoice - 1].value
 
-    // 6. DX分数
+    // 6. DX星级 (dxScore: 0-5)
     await session.send(
-      '请输入DX分数（整数）\n\n' +
-      '输入0取消操作'
+      '请输入DX星级（整数，0-5）\n\n' +
+      INTERACTIVE_CANCEL_HINT
     )
-    const dxScoreInput = await session.prompt(timeout)
-    if (!dxScoreInput || dxScoreInput.trim() === '0') {
+    const dxInput = await session.prompt(timeout)
+    if (!dxInput || isInteractiveCancel(dxInput)) {
       return null
     }
-    const dxScore = parseInt(dxScoreInput.trim(), 10)
-    if (isNaN(dxScore) || dxScore < 0) {
-      await session.send('❌ DX分数必须是大于等于0的数字，操作已取消')
+    const dxScore = parseInt(dxInput.trim(), 10)
+    if (isNaN(dxScore) || dxScore < 0 || dxScore > 5) {
+      await session.send('❌ DX星级必须在 0-5 之间，操作已取消')
       return null
     }
+
+    // 7. 评价等级 (rank)
+    const rankOptionsText = RANK_OPTIONS.map(
+      (opt, idx) => `${idx + 1}. ${opt.label}`
+    ).join('\n')
+    await session.send(
+      `请选择评价等级：\n\n${rankOptionsText}\n\n请输入对应的数字（1-${RANK_OPTIONS.length}），${INTERACTIVE_CANCEL_HINT}`
+    )
+    const rankInput = await session.prompt(timeout)
+    if (isInteractiveCancel(rankInput)) {
+      return null
+    }
+    const rankChoice = parseInt(rankInput?.trim() || '', 10)
+    if (rankChoice < 1 || rankChoice > RANK_OPTIONS.length) {
+      await session.send('❌ 无效的选择，操作已取消')
+      return null
+    }
+    const rank = RANK_OPTIONS[rankChoice - 1].value
 
     return {
       musicId,
-      level,
+      levelId,
       achievement,
-      fcStatus,
-      syncStatus,
+      combo,
+      sync,
       dxScore,
+      rank,
     }
   } catch {
     return null
@@ -1656,7 +1710,7 @@ export function apply(ctx: Context, config: Config) {
   if (isPublicApi) {
     if (!config.publicGatewayToken?.trim()) {
       throw new Error(
-        '[maibot] 公共 API（apiMode: public）须配置 publicGatewayToken。申请：https://api.awmc.cc · 购买额度：https://store.awmc.cc',
+        '[maibot] 公共 API（apiMode: public）须配置 publicGatewayToken。申请：https://api.awmc.team · 购买额度：https://store.awmc.team',
       )
     }
   } else {
@@ -2679,14 +2733,14 @@ export function apply(ctx: Context, config: Config) {
           helpText += `
 
 🎁 收藏品管理：
-  /mai获取收藏品 [SGID或@用户] - 获取收藏品（可选首参传 SGID/链接 或代操 @用户；支持缓存，/mai发收藏品 为别名）
-  /mai清收藏品 - 清空收藏品（交互式选择类别和ID）
+  /mai获取收藏品 [SGID或@用户] - 获取/解锁收藏品（可选首参传 SGID/链接 或代操 @用户；支持缓存，/mai发收藏品 为别名）
+  /mai上传乐曲成绩 [@用户] - 手动上传乐曲成绩（交互式输入，包含60秒安全等待）
   /mai修改版本号 [SGID或@用户] - 修改版本号（可选首参传 SGID/链接 或代操 @用户；支持缓存）`
 
           if (canProxy) {
             helpText += `
-  /mai获取收藏品 [@用户] - 为他人获取收藏品（需要auth等级${authLevelForProxy}以上）
-  /mai清收藏品 [@用户] - 清空他人的收藏品（需要auth等级${authLevelForProxy}以上）
+  /mai获取收藏品 [@用户] - 为他人获取/解锁收藏品（需要auth等级${authLevelForProxy}以上）
+  /mai上传乐曲成绩 [@用户] - 为他人上传乐曲成绩（需要auth等级${authLevelForProxy}以上）
   /mai修改版本号 [@用户] - 为他人修改版本号（需要auth等级${authLevelForProxy}以上）`
           }
       }
@@ -2778,7 +2832,7 @@ export function apply(ctx: Context, config: Config) {
       if (isPublicApi) {
         helpText += `
 
-ℹ️ 当前为公共 API 模式：详情调用请前往 https://wiki.awmc.cc/dev/awmc-api 。官方交流群1072033605。`
+ℹ️ 当前为公共 API 模式：详情调用请前往 https://wiki.awmc.team/dev/awmc-api 。官方交流群1072033605。`
       }
 
       return helpText
@@ -2806,21 +2860,21 @@ export function apply(ctx: Context, config: Config) {
         
         // 检查返回结果是否为 {"result":"Pong"}
         if (result.result === 'Pong') {
-          return `✅ 机台连接正常\n\n📊 查看所有服务状态: https://status.awmc.cc`
+          return `✅ 机台连接正常\n\n📊 查看所有服务状态: https://status.awmc.team`
         } else if (result.returnCode === 1 && result.serverTime) {
           const serverTime = new Date(result.serverTime * 1000).toLocaleString('zh-CN')
-          return `✅ 机台连接正常\n服务器时间: ${serverTime}\n\n📊 查看所有服务状态: https://status.awmc.cc`
+          return `✅ 机台连接正常\n服务器时间: ${serverTime}\n\n📊 查看所有服务状态: https://status.awmc.team`
         } else if (result.result === 'down') {
-          return `❌ 机台连接失败，机台可能已下线\n\n📊 查看所有服务状态: https://status.awmc.cc`
+          return `❌ 机台连接失败，机台可能已下线\n\n📊 查看所有服务状态: https://status.awmc.team`
         } else {
-          return `⚠️ 机台状态未知\n返回结果: ${JSON.stringify(result)}\n\n📊 查看所有服务状态: https://status.awmc.cc`
+          return `⚠️ 机台状态未知\n返回结果: ${JSON.stringify(result)}\n\n📊 查看所有服务状态: https://status.awmc.team`
         }
       } catch (error: any) {
         ctx.logger('maibot').error('Ping机台失败:', error)
         if (maintenanceMode) {
-          return `${maintenanceMessage}\n\n📊 查看所有服务状态: https://status.awmc.cc`
+          return `${maintenanceMessage}\n\n📊 查看所有服务状态: https://status.awmc.team`
         }
-        return `❌ Ping失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}\n\n📊 查看所有服务状态: https://status.awmc.cc`
+        return `❌ Ping失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}\n\n📊 查看所有服务状态: https://status.awmc.team`
       }
     })
 
@@ -3038,7 +3092,7 @@ export function apply(ctx: Context, config: Config) {
         // 使用新API获取用户信息（team 模式需 client_id；public 网关仅 qr_text）
         let previewResult
         try {
-          previewResult = await api.getPreview(machineInfo.clientId, qrCode)
+          previewResult = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
         } catch (error: any) {
           ctx.logger('maibot').error('获取用户预览信息失败:', error)
           const errorMessage = `❌ 绑定失败：无法从二维码获取用户信息\n错误信息: ${getSafeErrorMessage(error, session)}`
@@ -3282,7 +3336,7 @@ export function apply(ctx: Context, config: Config) {
             try {
               // 同时获取 preview 和 getCharge（并行执行，避免重复排队）
               const [preview, chargeResult] = await Promise.all([
-                api.getPreview(machineInfo.clientId, qrTextResult.qrText),
+                api.getPreview(machineInfo?.clientId ?? '', qrTextResult.qrText),
                 api.getCharge(
                   machineInfo.regionId,
                   machineInfo.clientId,
@@ -3915,7 +3969,8 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  if (!isPublicApi) {
+  // public/team 均可用：公共网关已支持 /v1/*_manual 兼容（上传成绩 / 解锁收藏品等）
+  {
   /**
    * 发票（2-6倍票）
    * 用法: /mai发票 [倍数] [@用户id]，默认2
@@ -4226,7 +4281,7 @@ export function apply(ctx: Context, config: Config) {
         let qrTextResult
         if (qrCode) {
           try {
-            const preview = await api.getPreview(machineInfo.clientId, qrCode)
+            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
@@ -4439,7 +4494,7 @@ export function apply(ctx: Context, config: Config) {
         let qrTextResult
         if (qrCode) {
           try {
-            const preview = await api.getPreview(machineInfo.clientId, qrCode)
+            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
@@ -4867,15 +4922,15 @@ export function apply(ctx: Context, config: Config) {
 
         const selectedType = COLLECTION_TYPE_OPTIONS.find(opt => opt.value === itemKind)
         await session.send(
-          `已选择：${selectedType?.label} (${itemKind})\n\n` +
+          `已选择：${selectedType?.label}\n\n` +
           `请输入收藏品 ID（数字）\n` +
           `若不知道 ID，可前往 https://sdgb.lemonno.xyz/ 查询；乐曲解禁请输入乐曲 ID。\n\n` +
-          `输入 0 取消`
+          INTERACTIVE_CANCEL_HINT
         )
 
         const promptSession = await waitForUserReply(session, ctx, 60000)
         const itemIdInput = promptSession?.content?.trim() || ''
-        if (!itemIdInput || itemIdInput === '0') {
+        if (!itemIdInput || isInteractiveCancel(itemIdInput)) {
           return '操作已取消'
         }
 
@@ -4884,10 +4939,10 @@ export function apply(ctx: Context, config: Config) {
           return '❌ 收藏品 ID 必须为数字，请重新输入'
         }
 
-        await session.send('请输入获取数量（正整数，默认 1）。输入 0 取消')
+        await session.send(`请输入获取数量（正整数，默认 1）。${INTERACTIVE_CANCEL_HINT}`)
         const promptStock = await waitForUserReply(session, ctx, 60000)
         const stockInput = promptStock?.content?.trim() ?? '1'
-        if (stockInput === '0') {
+        if (isInteractiveCancel(stockInput)) {
           return '操作已取消'
         }
         const itemStock = parseInt(stockInput, 10)
@@ -4900,7 +4955,7 @@ export function apply(ctx: Context, config: Config) {
         if (!options?.bypass) {
           const confirm = await promptYesLocal(
             session,
-            `⚠️ 即将为 ${maskUserId(binding.maiUid)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label} (${itemKind})\nID: ${itemId}\n数量: ${stockFinal}\n确认继续？`
+            `⚠️ 即将为 ${maskUserId(binding.maiUid)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}\nID: ${itemId}\n数量: ${stockFinal}\n确认继续？`
           )
           if (!confirm) {
             return '操作已取消'
@@ -4911,7 +4966,7 @@ export function apply(ctx: Context, config: Config) {
         let qrTextResult: { qrText: string; error?: string; fromCache?: boolean }
         if (qrCode) {
           try {
-            const preview = await api.getPreview(machineInfo.clientId, qrCode)
+            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
@@ -4944,21 +4999,65 @@ export function apply(ctx: Context, config: Config) {
 
         await session.send('请求已提交，请等待服务器响应。（通常约 2–3 分钟）')
 
-        // 使用 API 获取收藏品（需要 qr_text）
+        // 根据收藏品类型选择对应的 API
         let result
         let usedCache = qrTextResult.fromCache === true
         try {
-          result = await api.getItem(
-            machineInfo.regionId,
-            machineInfo.regionName,
-            machineInfo.clientId,
-            machineInfo.placeId,
-            machineInfo.placeName,
-            parseInt(itemId, 10),
-            itemKind,
-            stockFinal,
-            qrTextResult.qrText
-          )
+          if (itemKind === 5) {
+            // 乐曲解禁：使用 unlock_music_manual
+            result = await api.unlockMusicManual(
+              qrTextResult.qrText,
+              parseInt(itemId, 10),
+              stockFinal,
+              0 // remaster 默认 0（不解锁白谱）
+            )
+          } else if (itemKind === 6) {
+            // 解锁 Master：使用 unlock_music_manual
+            result = await api.unlockMusicManual(
+              qrTextResult.qrText,
+              parseInt(itemId, 10),
+              stockFinal,
+              0
+            )
+          } else if (itemKind === 7) {
+            // 解锁 Re:Master：使用 unlock_music_manual
+            result = await api.unlockMusicManual(
+              qrTextResult.qrText,
+              parseInt(itemId, 10),
+              stockFinal,
+              1 // remaster=1 解锁 Re:MASTER
+            )
+          } else if (itemKind === 8) {
+            // 解锁黑铺：使用 unlock_music_manual（仅白谱）
+            result = await api.unlockMusicManual(
+              qrTextResult.qrText,
+              parseInt(itemId, 10),
+              stockFinal,
+              2 // remaster=2 仅白谱
+            )
+          } else {
+            // 其他收藏品：使用 unlock_single_item_manual
+            // 映射旧 itemKind 到新 API 的 item_kind
+            let apiItemKind = itemKind
+            if (itemKind === 1) apiItemKind = 1 // 姓名框
+            else if (itemKind === 2) apiItemKind = 2 // 称号
+            else if (itemKind === 3) apiItemKind = 3 // 头像
+            else if (itemKind === 9) apiItemKind = 10 // 旅行伙伴 -> 搭档 (10)
+            else if (itemKind === 10) apiItemKind = 10 // 搭档
+            else if (itemKind === 11) apiItemKind = 11 // 背景板
+            else if (itemKind === 12) apiItemKind = 12 // 功能票
+            else if (itemKind === 13) apiItemKind = 13 // 舞里程
+            else if (itemKind === 14) apiItemKind = 14 // 米奇妙妙屋
+            else if (itemKind === 15) apiItemKind = 15 // KALEIDXSCOPE
+            else apiItemKind = itemKind
+
+            result = await api.unlockSingleItemManual(
+              qrTextResult.qrText,
+              parseInt(itemId, 10),
+              apiItemKind,
+              stockFinal
+            )
+          }
         } catch (error: any) {
           if (usedCache) {
             logger.info('使用缓存的SGID失败，尝试重新获取SGID')
@@ -4967,52 +5066,86 @@ export function apply(ctx: Context, config: Config) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
             await waitForQueue(session)
-            result = await api.getItem(
-              machineInfo.regionId,
-              machineInfo.regionName,
-              machineInfo.clientId,
-              machineInfo.placeId,
-              machineInfo.placeName,
-              parseInt(itemId, 10),
-              itemKind,
-              stockFinal,
-              retryQrText.qrText
-            )
+            // 重试同样的 API 调用
+            if (itemKind === 5 || itemKind === 6 || itemKind === 7 || itemKind === 8) {
+              let remaster = 0
+              if (itemKind === 7) remaster = 1
+              if (itemKind === 8) remaster = 2
+              result = await api.unlockMusicManual(
+                retryQrText.qrText,
+                parseInt(itemId, 10),
+                stockFinal,
+                remaster
+              )
+            } else {
+              let apiItemKind = itemKind
+              if (itemKind === 1) apiItemKind = 1
+              else if (itemKind === 2) apiItemKind = 2
+              else if (itemKind === 3) apiItemKind = 3
+              else if (itemKind === 9) apiItemKind = 10
+              else if (itemKind === 10) apiItemKind = 10
+              else if (itemKind === 11) apiItemKind = 11
+              else if (itemKind === 12) apiItemKind = 12
+              else if (itemKind === 13) apiItemKind = 13
+              else if (itemKind === 14) apiItemKind = 14
+              else if (itemKind === 15) apiItemKind = 15
+              result = await api.unlockSingleItemManual(
+                retryQrText.qrText,
+                parseInt(itemId, 10),
+                apiItemKind,
+                stockFinal
+              )
+            }
           } else {
             throw error
           }
         }
 
-        if (!result.UserAllStatus || !result.LoginStatus || !result.LogoutStatus) {
-          if (usedCache && (!result.QrStatus || result.LoginStatus === false)) {
+        // 新 API 返回格式：{ success: boolean, result?: { returnCode, apiName }, msg?: string }
+        if (!result.success || (result.result && result.result.returnCode !== 1)) {
+          const errorMsg = result.msg || '服务器返回未成功'
+          if (usedCache && (errorMsg.includes('二维码') || errorMsg.includes('qr_text') || errorMsg.includes('无效') || errorMsg.includes('登录'))) {
             logger.info('使用缓存的SGID失败，尝试重新获取SGID')
             const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
             await waitForQueue(session)
-            result = await api.getItem(
-              machineInfo.regionId,
-              machineInfo.regionName,
-              machineInfo.clientId,
-              machineInfo.placeId,
-              machineInfo.placeName,
-              parseInt(itemId, 10),
-              itemKind,
-              stockFinal,
-              retryQrText.qrText
-            )
-            if (!result.UserAllStatus || !result.LoginStatus || !result.LogoutStatus) {
-              if (!result.QrStatus || result.LoginStatus === false) {
-                return `❌ 获取收藏品失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}`
-              }
-              return '❌ 获取收藏品失败：服务器返回未成功，请稍后再试或刷新二维码后再试。'
+            // 重试
+            if (itemKind === 5 || itemKind === 6 || itemKind === 7 || itemKind === 8) {
+              let remaster = 0
+              if (itemKind === 7) remaster = 1
+              if (itemKind === 8) remaster = 2
+              result = await api.unlockMusicManual(
+                retryQrText.qrText,
+                parseInt(itemId, 10),
+                stockFinal,
+                remaster
+              )
+            } else {
+              let apiItemKind = itemKind
+              if (itemKind === 1) apiItemKind = 1
+              else if (itemKind === 2) apiItemKind = 2
+              else if (itemKind === 3) apiItemKind = 3
+              else if (itemKind === 9) apiItemKind = 10
+              else if (itemKind === 10) apiItemKind = 10
+              else if (itemKind === 11) apiItemKind = 11
+              else if (itemKind === 12) apiItemKind = 12
+              else if (itemKind === 13) apiItemKind = 13
+              else if (itemKind === 14) apiItemKind = 14
+              else if (itemKind === 15) apiItemKind = 15
+              result = await api.unlockSingleItemManual(
+                retryQrText.qrText,
+                parseInt(itemId, 10),
+                apiItemKind,
+                stockFinal
+              )
+            }
+            if (!result.success || (result.result && result.result.returnCode !== 1)) {
+              return `❌ 获取收藏品失败：${result.msg || '服务器返回未成功'}\n${qrOrLoginFailureHint()}`
             }
           } else {
-            if (!result.QrStatus || result.LoginStatus === false) {
-              return `❌ 获取收藏品失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}`
-            }
-            return '❌ 获取收藏品失败：服务器返回未成功，请稍后再试或刷新二维码后再试。'
+            return `❌ 获取收藏品失败：${errorMsg}\n${qrOrLoginFailureHint()}`
           }
         }
 
@@ -5069,7 +5202,7 @@ export function apply(ctx: Context, config: Config) {
         let qrTextResult: { qrText: string; error?: string; fromCache?: boolean }
         if (qrCode) {
           try {
-            const preview = await api.getPreview(machineInfo.clientId, qrCode)
+            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
@@ -5101,7 +5234,7 @@ export function apply(ctx: Context, config: Config) {
         let currentRom = ''
         let currentData = ''
         try {
-          const preview = await api.getPreview(machineInfo.clientId, qrTextResult.qrText)
+          const preview = await api.getPreview(machineInfo?.clientId ?? '', qrTextResult.qrText)
           if (preview.RomVersion) currentRom = preview.RomVersion
           if (preview.DataVersion) currentData = preview.DataVersion
         } catch {
@@ -5210,15 +5343,15 @@ export function apply(ctx: Context, config: Config) {
 
         const selectedType = COLLECTION_TYPE_OPTIONS.find(opt => opt.value === itemKind)
         await session.send(
-          `已选择：${selectedType?.label} (${itemKind})\n\n` +
+          `已选择：${selectedType?.label}\n\n` +
           `请输入收藏品ID（数字）\n` +
           `如果不知道收藏品ID，请前往 https://sdgb.lemonno.xyz/ 查询\n` +
           `乐曲解禁请输入乐曲ID\n\n` +
-          `输入0取消操作`
+          INTERACTIVE_CANCEL_HINT
         )
 
         const itemIdInput = await session.prompt(60000)
-        if (!itemIdInput || itemIdInput.trim() === '0') {
+        if (!itemIdInput || isInteractiveCancel(itemIdInput)) {
           return '操作已取消'
         }
 
@@ -5232,7 +5365,7 @@ export function apply(ctx: Context, config: Config) {
         if (!options?.bypass) {
           const confirm = await promptYesLocal(
             session,
-            `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label} (${itemKind})\nID: ${itemId}\n确认继续？`
+            `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label}\nID: ${itemId}\n确认继续？`
           )
           if (!confirm) {
             return '操作已取消'
@@ -5272,11 +5405,10 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 上传乐曲成绩
-   * 用法: /mai上传乐曲成绩
-   * @deprecated 上传乐曲成绩功能已在新API中移除，已注释
+   * 用法: /mai上传乐曲成绩 [targetUserId:text]
+   * 使用新API: POST /api/private/upload_score_manual
    */
-  /*
-  ctx.command('mai上传乐曲成绩 [targetUserId:text]', '上传游戏乐曲成绩')
+  ctx.command('mai上传乐曲成绩 [targetUserId:text]', '上传游戏乐曲成绩（手动）')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
     .action(async ({ session, options }, targetUserId) => {
@@ -5299,9 +5431,9 @@ export function apply(ctx: Context, config: Config) {
           return '操作已取消'
         }
 
-        const levelLabel = LEVEL_OPTIONS.find(opt => opt.value === scoreData.level)?.label || scoreData.level.toString()
-        const fcLabel = FC_STATUS_OPTIONS.find(opt => opt.value === scoreData.fcStatus)?.label || scoreData.fcStatus.toString()
-        const syncLabel = SYNC_STATUS_OPTIONS.find(opt => opt.value === scoreData.syncStatus)?.label || scoreData.syncStatus.toString()
+        const levelLabel = ['Basic', 'Advanced', 'Expert', 'Master', 'Re:Master'][scoreData.levelId] || scoreData.levelId.toString()
+        const fcLabel = FC_STATUS_OPTIONS.find(opt => opt.value === scoreData.combo)?.label || scoreData.combo.toString()
+        const syncLabel = SYNC_STATUS_OPTIONS.find(opt => opt.value === scoreData.sync)?.label || scoreData.sync.toString()
 
         // 确认操作（如果未使用 -bypass）
         if (!options?.bypass) {
@@ -5309,11 +5441,12 @@ export function apply(ctx: Context, config: Config) {
             session,
             `⚠️ 即将为 ${maskUserId(binding.maiUid)} 上传乐曲成绩\n` +
             `乐曲ID: ${scoreData.musicId}\n` +
-            `难度等级: ${levelLabel} (${scoreData.level})\n` +
-            `达成率: ${scoreData.achievement}\n` +
-            `Full Combo: ${fcLabel} (${scoreData.fcStatus})\n` +
-            `同步状态: ${syncLabel} (${scoreData.syncStatus})\n` +
-            `DX分数: ${scoreData.dxScore}\n` +
+            `难度: ${levelLabel}\n` +
+            `成就值: ${scoreData.achievement}\n` +
+            `连击: ${fcLabel}\n` +
+            `同步: ${syncLabel}\n` +
+            `DX星级: ${scoreData.dxScore}\n` +
+            `评价: ${scoreData.rank}\n` +
             `确认继续？`
           )
           if (!confirm) {
@@ -5321,97 +5454,88 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
-
-        const result = await api.uploadScore(
-          binding.maiUid,
-          machineInfo.clientId,
-          machineInfo.regionId,
-          machineInfo.placeId,
-          machineInfo.placeName,
-          machineInfo.regionName,
-          scoreData.musicId,
-          scoreData.level,
-          scoreData.achievement,
-          scoreData.fcStatus,
-          scoreData.syncStatus,
-          scoreData.dxScore,
-        )
-
-        // 检查4个状态字段是否都是 true
-        const loginStatus = result.LoginStatus === true
-        const logoutStatus = result.LogoutStatus === true
-        const uploadStatus = result.UploadStatus === true
-        const userLogStatus = result.UserLogStatus === true
-
-        // 如果4个状态都是 true，则上传成功
-        if (loginStatus && logoutStatus && uploadStatus && userLogStatus) {
-          return `✅ 已为 ${maskUserId(binding.maiUid)} 上传乐曲成绩\n` +
-                 `乐曲ID: ${scoreData.musicId}\n` +
-                 `难度: ${levelLabel}`
+        // 获取 qr_text
+        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        if (qrTextResult.error) {
+          return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
-        // 如果4个状态都是 false，需要重新绑定二维码
-        if (
-          result.LoginStatus === false &&
-          result.LogoutStatus === false &&
-          result.UploadStatus === false &&
-          result.UserLogStatus === false
-        ) {
-          await session.send('🔄 二维码已失效，需要重新绑定后才能继续操作')
-          const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-          if (rebindResult.success && rebindResult.newBinding) {
-            // 重新绑定成功后，尝试再次上传
-            try {
-              await session.send('⏳ 重新绑定成功，正在重新执行上传操作...')
-              const retryResult = await api.uploadScore(
-                rebindResult.newBinding.maiUid,
-                machineInfo.clientId,
-                machineInfo.regionId,
-                machineInfo.placeId,
-                machineInfo.placeName,
-                machineInfo.regionName,
-                scoreData.musicId,
-                scoreData.level,
-                scoreData.achievement,
-                scoreData.fcStatus,
-                scoreData.syncStatus,
-                scoreData.dxScore,
-              )
-              
-              if (
-                retryResult.LoginStatus === false &&
-                retryResult.LogoutStatus === false &&
-                retryResult.UploadStatus === false &&
-                retryResult.UserLogStatus === false
-              ) {
-                await session.send('❌ 重新绑定后上传仍然失败，请检查二维码是否正确')
-                return `❌ 重新绑定后上传仍然失败\n错误信息： ${JSON.stringify(retryResult)}`
-              }
-              
-              const retryLoginStatus = retryResult.LoginStatus === true
-              const retryLogoutStatus = retryResult.LogoutStatus === true
-              const retryUploadStatus = retryResult.UploadStatus === true
-              const retryUserLogStatus = retryResult.UserLogStatus === true
+        await waitForQueue(session)
+        await session.send('请求已提交，请等待服务器响应。（包含约60秒安全等待）')
 
-              if (retryLoginStatus && retryLogoutStatus && retryUploadStatus && retryUserLogStatus) {
-                return `✅ 重新绑定成功！已为 ${maskUserId(rebindResult.newBinding.maiUid)} 上传乐曲成绩\n` +
-                       `乐曲ID: ${scoreData.musicId}\n` +
-                       `难度: ${levelLabel}`
-              }
-              
-              return `⚠️ 重新绑定成功，但上传部分失败\n错误信息： ${JSON.stringify(retryResult)}`
-            } catch (retryError) {
-              logger.error('重新绑定后上传失败:', retryError)
-              return `✅ 重新绑定成功，但上传操作失败，请稍后重试`
+        // 使用新API上传成绩
+        let result
+        let usedCache = qrTextResult.fromCache === true
+        try {
+          result = await api.uploadScoreManual(
+            qrTextResult.qrText,
+            scoreData.musicId,
+            scoreData.levelId,
+            scoreData.achievement,
+            scoreData.combo,
+            scoreData.sync,
+            scoreData.dxScore,
+            scoreData.rank
+          )
+        } catch (error: any) {
+          if (usedCache) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)
+            if (retryQrText.error) {
+              return `❌ 获取二维码失败：${retryQrText.error}`
             }
+            await waitForQueue(session)
+            result = await api.uploadScoreManual(
+              retryQrText.qrText,
+              scoreData.musicId,
+              scoreData.levelId,
+              scoreData.achievement,
+              scoreData.combo,
+              scoreData.sync,
+              scoreData.dxScore,
+              scoreData.rank
+            )
           } else {
-            return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
+            throw error
           }
         }
 
-        // 其他失败情况，显示详细错误信息
-        return `❌ 上传失败\n错误信息： ${JSON.stringify(result)}`
+        // 新API返回格式：{ success: boolean, result?: { returnCode, apiName }, msg?: string }
+        if (!result.success || (result.result && result.result.returnCode !== 1)) {
+          const errorMsg = result.msg || '服务器返回未成功'
+          if (usedCache && (errorMsg.includes('二维码') || errorMsg.includes('qr_text') || errorMsg.includes('无效') || errorMsg.includes('登录'))) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)
+            if (retryQrText.error) {
+              return `❌ 获取二维码失败：${retryQrText.error}`
+            }
+            await waitForQueue(session)
+            result = await api.uploadScoreManual(
+              retryQrText.qrText,
+              scoreData.musicId,
+              scoreData.levelId,
+              scoreData.achievement,
+              scoreData.combo,
+              scoreData.sync,
+              scoreData.dxScore,
+              scoreData.rank
+            )
+            if (!result.success || (result.result && result.result.returnCode !== 1)) {
+              return `❌ 上传乐曲成绩失败：${result.msg || '服务器返回未成功'}\n${qrOrLoginFailureHint()}`
+            }
+          } else {
+            return `❌ 上传乐曲成绩失败：${errorMsg}\n${qrOrLoginFailureHint()}`
+          }
+        }
+
+        return `✅ 已为 ${maskUserId(binding.maiUid)} 上传乐曲成绩\n` +
+               `乐曲ID: ${scoreData.musicId}\n` +
+               `难度: ${levelLabel}\n` +
+               `成就值: ${scoreData.achievement}\n` +
+               `连击: ${fcLabel}\n` +
+               `同步: ${syncLabel}\n` +
+               `DX星级: ${scoreData.dxScore}\n` +
+               `评价: ${scoreData.rank}`
       } catch (error: any) {
         logger.error(`上传乐曲成绩失败: ${sanitizeError(error)}`)
         if (maintenanceMode) {
@@ -5424,7 +5548,6 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 上传失败\n错误信息： ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
-  */
 
   /**
    * 上传落雪B50
@@ -5498,7 +5621,7 @@ export function apply(ctx: Context, config: Config) {
         let qrTextResult
         if (qrCode) {
           try {
-            const preview = await api.getPreview(machineInfo.clientId, qrCode)
+            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
