@@ -64,7 +64,9 @@ export function sessionKeysManageGroup(managerField: string | undefined, session
 
 /** 从指令名映射到冷却槽；返回 null 表示不参与冷却 */
 export function commandToCooldownSlot(commandName: string): string | null {
-  const base = commandName.split(/\s+/)[0] || commandName
+  // Koishi 注册命令时 Command.normalize 会强制把名字转小写（参见 @koishijs/core）；
+  // 这里也做小写处理，避免 'mai上传B50' / 'mai上传b50' 因大小写不一致落入错误的槽。
+  const base = (commandName.split(/\s+/)[0] || commandName).toLowerCase()
   const excluded = new Set([
     'mai',
     'maiping',
@@ -86,7 +88,8 @@ export function commandToCooldownSlot(commandName: string): string | null {
   if (base === 'maibypass') return null
 
   if (base === 'mai发票') return 'ticket'
-  if (base === 'mai上传B50' || base === 'maiua' || base === 'mai上传落雪b50') return 'b50'
+  if (base === 'mai上传乐曲成绩' || base === 'mai获取收藏品' || base === 'mai发收藏品') return 'ticket'
+  if (base === 'mai上传b50' || base === 'maiua' || base === 'mai上传落雪b50') return 'b50'
   if (base === 'mai状态' || base === 'mymai') return 'status'
   return 'default'
 }
