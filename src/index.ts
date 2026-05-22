@@ -4921,25 +4921,30 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const selectedType = COLLECTION_TYPE_OPTIONS.find(opt => opt.value === itemKind)
-        await session.send(
-          `已选择：${selectedType?.label}\n\n` +
-          `请输入收藏品 ID（数字）\n` +
-          `若不知道 ID，可前往 https://sdgb.lemonno.xyz/ 查询；乐曲解禁请输入乐曲 ID。\n\n` +
-          INTERACTIVE_CANCEL_HINT
-        )
 
-        const promptSession = await waitForUserReply(session, ctx, 60000)
-        const itemIdInput = promptSession?.content?.trim() || ''
-        if (!itemIdInput || isInteractiveCancel(itemIdInput)) {
-          return '操作已取消'
+        let itemId = '0'
+        if (itemKind !== 13) {
+          await session.send(
+            `已选择：${selectedType?.label}\n\n` +
+            `请输入收藏品 ID（数字）\n` +
+            `若不知道 ID，可前往 https://sdgb.lemonno.xyz/ 查询；乐曲解禁请输入乐曲 ID。\n\n` +
+            INTERACTIVE_CANCEL_HINT
+          )
+
+          const promptSession = await waitForUserReply(session, ctx, 60000)
+          const itemIdInput = promptSession?.content?.trim() || ''
+          if (!itemIdInput || isInteractiveCancel(itemIdInput)) {
+            return '操作已取消'
+          }
+
+          itemId = itemIdInput.trim()
+          if (!/^\d+$/.test(itemId)) {
+            return '❌ 收藏品 ID 必须为数字，请重新输入'
+          }
         }
 
-        const itemId = itemIdInput.trim()
-        if (!/^\d+$/.test(itemId)) {
-          return '❌ 收藏品 ID 必须为数字，请重新输入'
-        }
-
-        await session.send(`请输入获取数量（正整数，默认 1）。${INTERACTIVE_CANCEL_HINT}`)
+        const stockLimit = itemKind === 13 ? 99999 : 999
+        await session.send(`请输入获取数量（正整数，最大 ${stockLimit}）。${INTERACTIVE_CANCEL_HINT}`)
         const promptStock = await waitForUserReply(session, ctx, 60000)
         const stockInput = promptStock?.content?.trim() ?? '1'
         if (isInteractiveCancel(stockInput)) {
@@ -4949,13 +4954,15 @@ export function apply(ctx: Context, config: Config) {
         if (!Number.isInteger(itemStock) || itemStock < 1) {
           return '❌ 数量必须为正整数，请重新执行指令并输入有效数量'
         }
-        const stockFinal = Math.min(itemStock, 999)
+        const stockFinal = Math.min(itemStock, stockLimit)
 
         // 确认操作（如果未使用 -bypass）
         if (!options?.bypass) {
           const confirm = await promptYesLocal(
             session,
-            `⚠️ 即将为 ${maskUserId(binding.maiUid)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}\nID: ${itemId}\n数量: ${stockFinal}\n确认继续？`
+              `⚠️ 即将为 ${maskUserId(binding.maiUid)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}` +
+              (itemKind === 13 ? '' : `\nID: ${itemId}`) +
+              `\n数量: ${stockFinal}\n确认继续？`
           )
           if (!confirm) {
             return '操作已取消'
@@ -5149,7 +5156,9 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        return `✅ 已为 ${maskUserId(binding.maiUid)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}\nID: ${itemId}\n数量: ${stockFinal}`
+        return `✅ 已为 ${maskUserId(binding.maiUid)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}` +
+               (itemKind === 13 ? '' : `\nID: ${itemId}`) +
+               `\n数量: ${stockFinal}`
       } catch (error: any) {
         logger.error(`获取收藏品失败: ${sanitizeError(error)}`)
         if (maintenanceMode) {
@@ -7358,4 +7367,3 @@ export function apply(ctx: Context, config: Config) {
       return `✅ 已清除 ${removed} 条冷却记录。\n尝试匹配的用户键：${candidates.join('、')}`
     })
 }
-
