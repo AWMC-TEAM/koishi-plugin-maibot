@@ -77,6 +77,7 @@ export interface Config {
   maintenanceMode?: boolean  // 维护模式开关
   maintenanceMessage?: string  // 维护模式提示消息
   hideLockAndProtection?: boolean  // 隐藏锁定模式和保护模式功能
+  enableMaimile?: boolean  // 舞里程发放功能开关（默认关闭，API暂不可用）
   whitelist?: {
     enabled: boolean  // 白名单开关
     guildIds: string[]  // 允许使用的群ID列表（兼容旧配置）
@@ -170,6 +171,7 @@ export const Config: Schema<Config> = Schema.object({
   maintenanceMode: Schema.boolean().default(false).description('维护模式开关，开启时所有指令都会提示维护信息'),
   maintenanceMessage: Schema.string().default('⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/').description('维护模式提示消息'),
   hideLockAndProtection: Schema.boolean().default(false).description('隐藏锁定模式和保护模式功能，开启后相关指令将不可用，状态信息也不会显示'),
+  enableMaimile: Schema.boolean().default(false).description('舞里程发放功能开关（默认关闭，因API暂不可用）'),
   whitelist: Schema.object({
     enabled: Schema.boolean().default(false).description('白名单开关，开启后只有白名单内的群可以使用Bot功能'),
     guildIds: Schema.array(Schema.string()).default(['1072033605']).description('允许使用Bot功能的群ID列表（兼容旧配置）'),
@@ -2229,6 +2231,7 @@ export function apply(ctx: Context, config: Config) {
   const maintenanceMode = config.maintenanceMode ?? false
   const maintenanceMessage = config.maintenanceMessage ?? '⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/'
   const hideLockAndProtection = config.hideLockAndProtection ?? false
+  const enableMaimile = config.enableMaimile ?? false
 
   // 创建使用配置的 promptYes 函数
   const promptYesWithConfig = async (session: Session, message: string, timeout?: number): Promise<boolean> => {
@@ -2720,14 +2723,16 @@ export function apply(ctx: Context, config: Config) {
   /mai清票 [@用户] - 清空他人的功能票（需要auth等级${authLevelForProxy}以上）`
           }
 
-          helpText += `
+          if (enableMaimile) {
+            helpText += `
 
 🎮 游戏功能：
   /mai舞里程 <里程数> - 为账号发放舞里程（必须是1000的倍数）`
 
-          if (canProxy) {
-            helpText += `
+            if (canProxy) {
+              helpText += `
   /mai舞里程 <里程数> [@用户] - 为他人发放舞里程（需要auth等级${authLevelForProxy}以上）`
+            }
           }
 
           helpText += `
