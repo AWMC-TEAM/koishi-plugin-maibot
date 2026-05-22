@@ -549,13 +549,14 @@ const COLLECTION_TYPE_OPTIONS = [
   { label: 'KALEIDXSCOPE 钥匙', value: 15 },
 ]
 
-async function promptCollectionType(session: Session, timeout = 60000): Promise<number | null> {
-  const optionsText = COLLECTION_TYPE_OPTIONS.map(
+async function promptCollectionType(session: Session, timeout = 60000, excludeValues: number[] = []): Promise<number | null> {
+  const availableOptions = COLLECTION_TYPE_OPTIONS.filter(opt => !excludeValues.includes(opt.value))
+  const optionsText = availableOptions.map(
     (opt, idx) => `${idx + 1}. ${opt.label}`
   ).join('\n')
   
   await session.send(
-    `请问你需要什么类型收藏品？\n\n${optionsText}\n\n请输入对应的数字（1-${COLLECTION_TYPE_OPTIONS.length}），${INTERACTIVE_CANCEL_HINT}`
+    `请问你需要什么类型收藏品？\n\n${optionsText}\n\n请输入对应的数字（1-${availableOptions.length}），或输入 00 取消`
   )
   
   try {
@@ -563,10 +564,14 @@ async function promptCollectionType(session: Session, timeout = 60000): Promise<
     if (isInteractiveCancel(answer)) {
       return null
     }
-    const choice = parseInt(answer?.trim() || '', 10)
+    const choice = parseInt(answer?.trim() || '0', 10)
     
-    if (choice >= 1 && choice <= COLLECTION_TYPE_OPTIONS.length) {
-      return COLLECTION_TYPE_OPTIONS[choice - 1].value
+    if (choice === 0) {
+      return null
+    }
+    
+    if (choice >= 1 && choice <= availableOptions.length) {
+      return availableOptions[choice - 1].value
     }
     
     return null
@@ -4920,7 +4925,7 @@ export function apply(ctx: Context, config: Config) {
         const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
 
         // 交互式选择收藏品类别
-        const itemKind = await promptCollectionType(session)
+        const itemKind = await promptCollectionType(session, 60000, enableMaimile ? [] : [13])
         if (itemKind === null) {
           return '操作已取消'
         }
