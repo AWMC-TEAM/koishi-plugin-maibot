@@ -530,10 +530,10 @@ function isInteractiveCancel(input: string | undefined | null): boolean {
 }
 
 const COLLECTION_TYPE_OPTIONS = [
-  { label: '头像框', value: 1 },
+  { label: '姓名框', value: 1 },
   { label: '称号', value: 2 },
   { label: '头像', value: 3 },
-  { label: '乌蒙地插一个', value: 4 },
+  { label: '礼物', value: 4 },
   { label: '乐曲', value: 5 },
   { label: '解锁Master', value: 6 },
   { label: '解锁Re:Master', value: 7 },
@@ -542,9 +542,9 @@ const COLLECTION_TYPE_OPTIONS = [
   { label: '搭档', value: 10 },
   { label: '背景板', value: 11 },
   { label: '功能票', value: 12 },
-  { label: '舞里程 [未测试]', value: 13 },
-  { label: '米奇妙妙屋 [未测试]', value: 14 },
-  { label: 'KALEIDXSCOPE [未测试]', value: 15 },
+  { label: '舞里程', value: 13 },
+  { label: '亲密度礼物', value: 14 },
+  { label: 'KALEIDXSCOPE 钥匙', value: 15 },
 ]
 
 async function promptCollectionType(session: Session, timeout = 60000): Promise<number | null> {

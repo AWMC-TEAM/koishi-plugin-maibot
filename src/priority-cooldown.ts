@@ -88,7 +88,7 @@ export function commandToCooldownSlot(commandName: string): string | null {
   if (base === 'maibypass') return null
 
   if (base === 'mai发票') return 'ticket'
-  if (base === 'mai上传乐曲成绩' || base === 'mai获取收藏品' || base === 'mai发收藏品') return 'ticket'
+  if (base === 'mai上传乐曲成绩' || base === 'mai获取收藏品') return 'ticket'
   if (base === 'mai上传b50' || base === 'maiua' || base === 'mai上传落雪b50') return 'b50'
   if (base === 'mai状态' || base === 'mymai') return 'status'
   return 'default'
