@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-maibot",
-  "version": "1.9.3",
+  "version": "1.9.4",
   "description": "舞萌DX游戏高级操作插件 for Koishi - 支持用户绑定、B50更新、账号状态提醒、1.5倍票获取等功能",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",

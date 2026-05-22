@@ -2282,6 +2282,66 @@ export function apply(ctx: Context, config: Config) {
     return next()
   }, true) // 设置为 true 使其在早期执行，但不影响普通消息
 
+  // 免责声明常量
+  const TERMS_DISCLAIMER = `⚠️ 本BOT提供的部分服务（如发票、上传B50等）可能会对您的舞萌账户造成不良影响，您需悉知。\nAWMC TEAM不对用户使用上述服务可能造成的不良后果负责。`
+  const TERMS_ACCEPT_TEXT = '我已阅读并了解以上风险并接受使用本工具可能造成的不良后果'
+
+  async function hasAcceptedTerms(userId: string): Promise<boolean> {
+    if (!userId) return false
+    const rows = await ctx.database.get('maibot_user_terms', { userId })
+    return rows.length > 0
+  }
+
+  async function saveTermsAccepted(userId: string): Promise<void> {
+    const existing = await ctx.database.get('maibot_user_terms', { userId })
+    if (existing.length === 0) {
+      await ctx.database.create('maibot_user_terms', { userId, acceptedAt: new Date() })
+    }
+  }
+
+  // 免责声明中间件：拦截所有 mai 开头的命令，要求用户先接受免责声明
+  ctx.middleware(async (session, next) => {
+    const content = session.content?.trim() || ''
+    // 匹配所有 mai 开头的命令
+    if (!content.match(/^\/?mai/i)) {
+      return next()
+    }
+
+    // 排除不需要声明的指令（帮助、绑定、ping、queue、alert）
+    const baseCmd = content.replace(/^\//, '').split(/\s+/)[0] || ''
+    const termsExempt = new Set(['mai', 'mai帮助', 'maiping', 'maiqueue', 'maialert', 'mai兑换卡密'])
+    if (termsExempt.has(baseCmd) || baseCmd.startsWith('maialert') || baseCmd.startsWith('mai管理员') || baseCmd === 'maibypass') {
+      return next()
+    }
+
+    const keys = await getSessionBindingKeys(ctx, session)
+    const primaryUserId = keys[0] || String(session.userId || '')
+    if (!primaryUserId) {
+      return next()
+    }
+
+    // 已接受过，放行
+    if (await hasAcceptedTerms(primaryUserId)) {
+      return next()
+    }
+
+    // 未接受：显示免责声明，等待用户输入确认文本
+    await session.send(`${TERMS_DISCLAIMER}\n\n请在 60 秒内输入以下内容以继续使用：\n${TERMS_ACCEPT_TEXT}`)
+
+    try {
+      const reply = await session.prompt(60000)
+      const replyText = (reply || '').trim()
+      if (replyText === TERMS_ACCEPT_TEXT) {
+        await saveTermsAccepted(primaryUserId)
+        await session.send('✅ 已确认，正在处理您的请求...')
+        return next()
+      }
+      return '❌ 未输入正确的确认内容，操作已取消'
+    } catch {
+      return '❌ 确认超时，操作已取消'
+    }
+  }, true)
+
   /**
    * 从文本中提取用户ID（支持@userid格式、<at id="数字"/>格式或直接userid）
    */
@@ -4953,26 +5013,50 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        const stockLimit = itemKind === 13 ? 99999 : 999
-        await session.send(`请输入获取数量（正整数，最大 ${stockLimit}）。${INTERACTIVE_CANCEL_HINT}`)
-        const promptStock = await waitForUserReply(session, ctx, 60000)
-        const stockInput = promptStock?.content?.trim() ?? '1'
-        if (isInteractiveCancel(stockInput)) {
-          return '操作已取消'
+        const UNLOCK_LOCK_KINDS = new Set([1, 2, 3, 5, 6, 7])
+        const isUnlockLockKind = UNLOCK_LOCK_KINDS.has(itemKind)
+
+        let stockFinal: number
+        if (isUnlockLockKind) {
+          await session.send(
+            `请输入操作模式（数字）：\n` +
+            `  0 = 锁定\n` +
+            `  1 = 解锁（默认）\n\n` +
+            INTERACTIVE_CANCEL_HINT
+          )
+          const promptStock = await waitForUserReply(session, ctx, 60000)
+          const stockInput = promptStock?.content?.trim() ?? '1'
+          if (isInteractiveCancel(stockInput)) {
+            return '操作已取消'
+          }
+          const itemStock = parseInt(stockInput, 10)
+          if (itemStock !== 0 && itemStock !== 1) {
+            return '❌ 只能输入 0（锁定）或 1（解锁）'
+          }
+          stockFinal = itemStock
+        } else {
+          const stockLimit = itemKind === 13 ? 99999 : 999
+          await session.send(`请输入获取数量（正整数，最大 ${stockLimit}）。${INTERACTIVE_CANCEL_HINT}`)
+          const promptStock = await waitForUserReply(session, ctx, 60000)
+          const stockInput = promptStock?.content?.trim() ?? '1'
+          if (isInteractiveCancel(stockInput)) {
+            return '操作已取消'
+          }
+          const itemStock = parseInt(stockInput, 10)
+          if (!Number.isInteger(itemStock) || itemStock < 1) {
+            return '❌ 数量必须为正整数，请重新执行指令并输入有效数量'
+          }
+          stockFinal = Math.min(itemStock, stockLimit)
         }
-        const itemStock = parseInt(stockInput, 10)
-        if (!Number.isInteger(itemStock) || itemStock < 1) {
-          return '❌ 数量必须为正整数，请重新执行指令并输入有效数量'
-        }
-        const stockFinal = Math.min(itemStock, stockLimit)
 
         // 确认操作（如果未使用 -bypass）
         if (!options?.bypass) {
+          const stockLabel = isUnlockLockKind ? (stockFinal === 0 ? '锁定' : '解锁') : `数量: ${stockFinal}`
           const confirm = await promptYesLocal(
             session,
               `⚠️ 即将为 ${maskUserId(binding.maiUid)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}` +
               (itemKind === 13 ? '' : `\nID: ${itemId}`) +
-              `\n数量: ${stockFinal}\n确认继续？`
+              `\n${stockLabel}\n确认继续？`
           )
           if (!confirm) {
             return '操作已取消'
@@ -5166,9 +5250,10 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
+        const resultLabel = isUnlockLockKind ? (stockFinal === 0 ? '锁定' : '解锁') : `数量: ${stockFinal}`
         return `✅ 已为 ${maskUserId(binding.maiUid)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}` +
                (itemKind === 13 ? '' : `\nID: ${itemId}`) +
-               `\n数量: ${stockFinal}`
+               `\n${resultLabel}`
       } catch (error: any) {
         logger.error(`获取收藏品失败: ${sanitizeError(error)}`)
         if (maintenanceMode) {

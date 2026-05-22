@@ -101,6 +101,11 @@ export interface MaiBotUserRebindState {
   lastBindChangeAt: Date
 }
 
+export interface MaiBotUserTerms {
+  userId: string
+  acceptedAt: Date
+}
+
 declare module 'koishi' {
   interface Tables {
     maibot_bindings: UserBinding
@@ -112,6 +117,7 @@ declare module 'koishi' {
     maibot_group_priority: MaiBotGroupPriority
     maibot_group_rebind_pending: MaiBotGroupRebindPending
     maibot_user_rebind_state: MaiBotUserRebindState
+    maibot_user_terms: MaiBotUserTerms
   }
 }
 
@@ -230,6 +236,13 @@ export function extendDatabase(ctx: Context) {
   ctx.model.extend('maibot_user_rebind_state', {
     userId: 'string',
     lastBindChangeAt: 'timestamp',
+  }, {
+    primary: 'userId',
+  })
+
+  ctx.model.extend('maibot_user_terms', {
+    userId: 'string',
+    acceptedAt: 'timestamp',
   }, {
     primary: 'userId',
   })
