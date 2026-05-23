@@ -4985,7 +4985,7 @@ export function apply(ctx: Context, config: Config) {
         const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
 
         // 交互式选择收藏品类别
-        const itemKind = await promptCollectionType(session, 60000, enableMaimile ? [] : [13])
+        const itemKind = await promptCollectionType(session, 60000, enableMaimile ? [] : [13, 15])
         if (itemKind === null) {
           return '操作已取消'
         }
