@@ -630,6 +630,21 @@ export class MaiBotAPI {
     return response.data
   }
 
+  /**
+   * 删除乐曲成绩
+   * POST /api/private/delete_score_manual
+   * 需要: qr_code, musicId, levelId
+   * levelId: 0=Basic, 1=Advanced, 2=Expert, 3=Master, 4=Re:Master
+   */
+  async deleteScoreManual(qrText: string, musicId: number, levelId: number): Promise<any> {
+    const response = await this.client.post('/api/private/delete_score_manual', {
+      qr_code: qrText,
+      musicId,
+      levelId,
+    })
+    return response.data
+  }
+
   // ========== 以下为旧API，已不再支持，保留用于兼容性 ==========
 
   /**

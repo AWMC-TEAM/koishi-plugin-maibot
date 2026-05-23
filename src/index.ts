@@ -2805,12 +2805,14 @@ export function apply(ctx: Context, config: Config) {
 🎁 收藏品管理：
   /mai获取收藏品 [SGID或@用户] - 获取/解锁收藏品（可选首参传 SGID/链接 或代操 @用户；支持缓存，/mai发收藏品 为别名）
   /mai上传乐曲成绩 [@用户] - 手动上传乐曲成绩（交互式输入，包含60秒安全等待）
+  /mai删除成绩 [@用户] - 删除指定乐曲的成绩（交互式输入）
   /mai修改版本号 [SGID或@用户] - 修改版本号（可选首参传 SGID/链接 或代操 @用户；支持缓存）`
 
           if (canProxy) {
             helpText += `
   /mai获取收藏品 [@用户] - 为他人获取/解锁收藏品（需要auth等级${authLevelForProxy}以上）
   /mai上传乐曲成绩 [@用户] - 为他人上传乐曲成绩（需要auth等级${authLevelForProxy}以上）
+  /mai删除成绩 [@用户] - 为他人删除成绩（需要auth等级${authLevelForProxy}以上）
   /mai修改版本号 [@用户] - 为他人修改版本号（需要auth等级${authLevelForProxy}以上）`
           }
       }
@@ -5015,9 +5017,12 @@ export function apply(ctx: Context, config: Config) {
 
         const UNLOCK_LOCK_KINDS = new Set([1, 2, 3, 5, 6, 7])
         const isUnlockLockKind = UNLOCK_LOCK_KINDS.has(itemKind)
+        const isFixedOneKind = itemKind === 9 // 旅行伙伴固定数量1
 
         let stockFinal: number
-        if (isUnlockLockKind) {
+        if (isFixedOneKind) {
+          stockFinal = 1
+        } else if (isUnlockLockKind) {
           await session.send(
             `请输入操作模式（数字）：\n` +
             `  0 = 锁定\n` +
@@ -5650,6 +5655,108 @@ export function apply(ctx: Context, config: Config) {
           return `❌ API请求失败\n错误信息： ${errorInfo}\n\n${maintenanceMessage}`
         }
         return `❌ 上传失败\n错误信息： ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
+      }
+    })
+
+  /**
+   * 删除乐曲成绩
+   * 用法: /mai删除成绩 [targetUserId:text]
+   * 使用API: POST /api/private/delete_score_manual
+   */
+  ctx.command('mai删除成绩 [targetUserId:text]', '删除指定乐曲的成绩')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }, targetUserId) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      try {
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
+        }
+
+        const proxyTip = isProxy ? `（代操作用户 ${binding.userId}）` : ''
+
+        // 1. 输入乐曲ID
+        await session.send(
+          '请输入要删除成绩的乐曲ID（数字）\n' +
+          '如果不知道乐曲ID，请前往 https://maimai.lxns.net/songs 查询\n\n' +
+          INTERACTIVE_CANCEL_HINT
+        )
+        const musicIdReply = await session.prompt(60000)
+        if (!musicIdReply || isInteractiveCancel(musicIdReply)) {
+          return '操作已取消'
+        }
+        const musicId = parseInt(musicIdReply.trim(), 10)
+        if (isNaN(musicId) || musicId <= 0) {
+          return '❌ 乐曲ID必须是大于0的数字，操作已取消'
+        }
+
+        // 2. 选择难度
+        const LEVEL_ID_OPTIONS = [
+          { label: 'Basic', value: 0 },
+          { label: 'Advanced', value: 1 },
+          { label: 'Expert', value: 2 },
+          { label: 'Master', value: 3 },
+          { label: 'Re:Master', value: 4 },
+        ]
+        const levelText = LEVEL_ID_OPTIONS.map(
+          (opt, idx) => `${idx + 1}. ${opt.label}`
+        ).join('\n')
+        await session.send(
+          `请选择难度：\n\n${levelText}\n\n请输入对应的数字（1-${LEVEL_ID_OPTIONS.length}），${INTERACTIVE_CANCEL_HINT}`
+        )
+        const levelReply = await session.prompt(60000)
+        if (!levelReply || isInteractiveCancel(levelReply)) {
+          return '操作已取消'
+        }
+        const levelChoice = parseInt(levelReply.trim(), 10)
+        if (levelChoice < 1 || levelChoice > LEVEL_ID_OPTIONS.length) {
+          return '❌ 无效的选择，操作已取消'
+        }
+        const levelId = LEVEL_ID_OPTIONS[levelChoice - 1].value
+        const levelLabel = LEVEL_ID_OPTIONS[levelChoice - 1].label
+
+        // 3. 确认
+        if (!options?.bypass) {
+          const confirm = await promptYesLocal(
+            session,
+            `⚠️ 即将删除 ${maskUserId(binding.maiUid)} 的乐曲成绩${proxyTip}\n乐曲ID: ${musicId}\n难度: ${levelLabel}\n确认继续？`
+          )
+          if (!confirm) {
+            return '操作已取消'
+          }
+        }
+
+        // 4. 获取 qr_text
+        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        if (qrTextResult.error) {
+          return `❌ 获取二维码失败：${qrTextResult.error}`
+        }
+
+        await waitForQueue(session)
+        await session.send('请求已提交，请等待服务器响应。（包含约60秒安全等待）')
+
+        // 5. 调用API
+        const result = await api.deleteScoreManual(qrTextResult.qrText, musicId, levelId)
+
+        if (result.success === false) {
+          return `❌ 删除成绩失败：${result.msg || '服务器返回未成功'}`
+        }
+
+        return `✅ 已删除 ${maskUserId(binding.maiUid)} 的乐曲成绩${proxyTip}\n乐曲ID: ${musicId}\n难度: ${levelLabel}`
+      } catch (error: any) {
+        logger.error(`删除乐曲成绩失败: ${sanitizeError(error)}`)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        if (error?.response) {
+          const errorInfo = error.response.data ? JSON.stringify(error.response.data) : `${error.response.status} ${error.response.statusText}`
+          return `❌ API请求失败\n错误信息： ${errorInfo}\n\n${maintenanceMessage}`
+        }
+        return `❌ 删除失败\n错误信息： ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
