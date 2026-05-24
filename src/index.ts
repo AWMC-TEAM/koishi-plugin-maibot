@@ -2383,6 +2383,30 @@ export function apply(ctx: Context, config: Config) {
     const platform = session.platform ? String(session.platform) : ''
     const legacy = await getBindRelatedLegacyUserIdsForTarget(ctx, platform, extracted)
     for (const id of legacy) keys.add(id)
+
+    // 通过 bind 插件反查 aid，补上 koishi:<aid>（实际记录冷却用的统一键）
+    const db = ctx.database as any
+    if (db && typeof db.get === 'function') {
+      try {
+        const pidCandidates = platform
+          ? [`${platform}:${extracted}`, extracted]
+          : [extracted]
+        let aid: number | string | undefined
+        for (const pid of pidCandidates) {
+          const rows = await db.get('binding', { pid })
+          if (rows?.length) {
+            aid = rows[0]?.aid
+            break
+          }
+        }
+        if (aid !== undefined && aid !== null) {
+          keys.add(`koishi:${String(aid)}`)
+        }
+      } catch {
+        // binding 表不存在或结构不一致时忽略
+      }
+    }
+
     for (const id of [...keys]) {
       const rows = await ctx.database.get('maibot_bindings', { userId: id })
       for (const b of rows) keys.add(b.userId)
@@ -7498,16 +7522,38 @@ export function apply(ctx: Context, config: Config) {
       return `✅ 已清除 ${n} 条个人优先记录。\n匹配键：${candidates.join('、')}`
     })
 
-  ctx.command('mai管理员设置个人优先 <targetUserId:text> <spec:text>', '设置个人优先：永久 / 时长 / clear')
+  ctx.command('mai管理员设置个人优先 [targetUserId:text] [spec:text]', '设置个人优先：永久 / 时长 / clear（无参数走交互式）')
     .userFields(['authority'])
     .action(async ({ session }, targetUserId, spec) => {
       if (!session) return '❌ 无法获取会话信息'
       if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
         return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上`
       }
-      if (!targetUserId?.trim() || !spec?.trim()) {
-        return '❌ 用法：/mai管理员设置个人优先 <@或ID> <永久|7d|clear>'
+
+      const promptMs = Math.max(90000, rebindTimeout)
+
+      // 交互式：未提供目标用户
+      if (!targetUserId?.trim()) {
+        await session.send(
+          `【设置个人优先】请在 ${Math.floor(promptMs / 1000)} 秒内发送目标用户（@用户 或数字ID）\n${INTERACTIVE_CANCEL_HINT}`
+        )
+        const r1 = await waitForUserReply(session, ctx, promptMs)
+        const replyText = r1?.content?.trim() || ''
+        if (!replyText || isInteractiveCancel(replyText)) return '操作已取消'
+        targetUserId = replyText
       }
+
+      // 交互式：未提供时长
+      if (!spec?.trim()) {
+        await session.send(
+          `请发送时长规格（永久 / 7d / 30d / clear 等）\n${INTERACTIVE_CANCEL_HINT}`
+        )
+        const r2 = await waitForUserReply(session, ctx, promptMs)
+        const replyText = r2?.content?.trim() || ''
+        if (!replyText || isInteractiveCancel(replyText)) return '操作已取消'
+        spec = replyText
+      }
+
       const sp = parsePriorityAdminSpec(spec)
       if (sp === null) {
         return '❌ 无效的 spec，示例：永久、7d、30d、clear'
@@ -7520,12 +7566,12 @@ export function apply(ctx: Context, config: Config) {
       return r.message
     })
 
-  ctx.command('mai管理员设置群组优先 <spec:text>', '直接设置群组优先（-g 指定群，默认当前群）')
+  ctx.command('mai管理员设置群组优先 [spec:text]', '直接设置群组优先（-g 指定群；无参数走交互式）')
     .userFields(['authority'])
     .usage(
       ' 示例：/mai管理员设置群组优先 clear -g qq:5911013814031454\n' +
         '或：/mai管理员设置群组优先 -g qq:5911013814031454 永久\n' +
-        '（仅数字群号时请写 qq:群号；在群内执行可省略 -g）',
+        '无参数：发指令后按提示输入群标识与时长（仅数字群号请写 qq:群号；在群内执行可省略群标识）',
     )
     .option('guild', '-g <guildKey:string> 群标识，如 qq:群号')
     .action(async ({ session, options }, spec) => {
@@ -7533,15 +7579,47 @@ export function apply(ctx: Context, config: Config) {
       if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
         return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上`
       }
+
+      const promptMs = Math.max(90000, rebindTimeout)
       const { spec: specOnly, guild: guildOpt } = splitGroupPrioritySpecAndGuild(spec, options?.guild)
-      if (!specOnly) {
-        return '❌ 用法：/mai管理员设置群组优先 <永久|7d|clear> [-g 群标识]'
+      let specFinal = specOnly
+      let guildFinal = guildOpt
+
+      // 无任何参数 → 全交互式
+      if (!specFinal) {
+        // 群标识
+        if (!guildFinal) {
+          const fromSessionGuild = canonicalGuildPriorityKey(session)
+          await session.send(
+            `【设置群组优先】请在 ${Math.floor(promptMs / 1000)} 秒内发送群标识（如 qq:123456）${fromSessionGuild ? `\n直接发送 0 则使用当前群 ${fromSessionGuild}` : ''}\n${INTERACTIVE_CANCEL_HINT}`
+          )
+          const r1 = await waitForUserReply(session, ctx, promptMs)
+          const replyText = r1?.content?.trim() || ''
+          if (isInteractiveCancel(replyText)) return '操作已取消'
+          if (replyText === '0' && fromSessionGuild) {
+            guildFinal = fromSessionGuild
+          } else if (replyText) {
+            guildFinal = replyText
+          } else {
+            return '操作已取消'
+          }
+        }
+
+        // 时长
+        await session.send(
+          `请发送时长规格（永久 / 7d / 30d / clear 等）\n${INTERACTIVE_CANCEL_HINT}`
+        )
+        const r2 = await waitForUserReply(session, ctx, promptMs)
+        const replyText = r2?.content?.trim() || ''
+        if (!replyText || isInteractiveCancel(replyText)) return '操作已取消'
+        specFinal = replyText
       }
-      const sp = parsePriorityAdminSpec(specOnly)
+
+      const sp = parsePriorityAdminSpec(specFinal)
       if (sp === null) {
         return '❌ 无效的 spec，示例：永久、7d、clear'
       }
-      let gk = (guildOpt.trim() || canonicalGuildPriorityKey(session) || '').trim()
+      let gk = (guildFinal.trim() || canonicalGuildPriorityKey(session) || '').trim()
       gk = normalizeGuildKeyForPriority(gk, session)
       if (!gk) {
         return '❌ 请使用 -g 指定群标识（platform:guildId），或在群聊内执行。'
