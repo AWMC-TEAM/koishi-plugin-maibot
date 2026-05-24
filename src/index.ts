@@ -1859,6 +1859,22 @@ export function apply(ctx: Context, config: Config) {
     if (commandToCooldownSlot(cmdName) === null) return
     const wl = checkWhitelist(sess, config)
     if (!wl.allowed) return
+
+    // 获取当前用户绑定的 maiUid（用于共享冷却）
+    let sessionMaiUid: string | undefined
+    try {
+      const binding = await getBindingBySession(ctx, sess)
+      if (binding?.maiUid) sessionMaiUid = binding.maiUid
+    } catch { /* 忽略 */ }
+
+    // 超过2个绑定时拦截有冷却的命令
+    if (sessionMaiUid) {
+      const sameUidBindings = await ctx.database.get('maibot_bindings', { maiUid: sessionMaiUid })
+      if (sameUidBindings.length > 2) {
+        return `❌ 您的游戏账号已被 ${sameUidBindings.length} 个用户绑定，请先解绑多余账号后再使用此功能。\n（使用 /mai解绑 解绑当前账号）`
+      }
+    }
+
     const hit = await checkCommandCooldown(
       ctx,
       sess,
@@ -1866,11 +1882,12 @@ export function apply(ctx: Context, config: Config) {
       cmdName,
       getCooldownPrimaryUserId,
       async (s) => getSessionBindingKeys(ctx, s),
+      sessionMaiUid,
     )
     if (hit) return hit
     const uid = await getCooldownPrimaryUserId(sess)
     if (!uid) return
-    await recordCommandCooldown(ctx, uid, cmdName, priorityCooldownCfg)
+    await recordCommandCooldown(ctx, uid, cmdName, priorityCooldownCfg, sessionMaiUid)
   })
 
   /**
@@ -3219,6 +3236,19 @@ export function apply(ctx: Context, config: Config) {
         const maiUid = String(previewResult.UserID)
         const userName = previewResult.UserName
         const rating = previewResult.Rating ? String(previewResult.Rating) : undefined
+
+        // 检查同一游戏账号是否已被其他 Bot 用户绑定
+        const sameUidBindings = await ctx.database.get('maibot_bindings', { maiUid })
+        const otherBindings = sameUidBindings.filter(b => b.userId !== userId)
+        if (otherBindings.length > 0) {
+          const earliest = otherBindings.sort(
+            (a, b) => new Date(a.bindTime).getTime() - new Date(b.bindTime).getTime()
+          )[0]
+          await session.send(
+            `⚠️ 此游戏账号已被其他用户绑定（最早绑定时间: ${new Date(earliest.bindTime).toLocaleString('zh-CN')}）。\n` +
+            `持有 SGID 即证明账号所有权，继续绑定后进入冷却期。`
+          )
+        }
 
         // 存储到数据库
         await ctx.database.create('maibot_bindings', {

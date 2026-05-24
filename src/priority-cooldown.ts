@@ -294,6 +294,8 @@ export async function checkCommandCooldown(
   getPrimaryUserId: (s: Session) => Promise<string>,
   /** 与 getPrimaryUserId 同一自然人的其它键（如各平台 ID）；用于识别在任一平台上兑换的个人优先 */
   getLinkedUserIdsForPriority?: (s: Session) => Promise<string[]>,
+  /** 当前用户绑定的 maiUid，用于跨账号共享冷却 */
+  maiUid?: string,
 ): Promise<string | null> {
   const c = cfg || {}
   if (!c.enabled) return null
@@ -320,15 +322,32 @@ export async function checkCommandCooldown(
   const needMs = slotCooldownMs(slot, c, priority)
   if (needMs <= 0) return null
 
+  // 先检查个人冷却键
   const rows = await ctx.database.get('maibot_user_cooldowns', { userId, slot })
   const row = rows[0]
-  if (!row) return null
+  if (row) {
+    const elapsed = Date.now() - new Date(row.lastAt).getTime()
+    if (elapsed < needMs) {
+      const remainingSec = Math.ceil((needMs - elapsed) / 1000)
+      return formatCooldownMessage(c, remainingSec)
+    }
+  }
 
-  const elapsed = Date.now() - new Date(row.lastAt).getTime()
-  if (elapsed >= needMs) return null
+  // 再检查 maiuid 共享冷却键（防止小号绕过）
+  if (maiUid) {
+    const sharedKey = `maiuid:${maiUid}`
+    const sharedRows = await ctx.database.get('maibot_user_cooldowns', { userId: sharedKey, slot })
+    const sharedRow = sharedRows[0]
+    if (sharedRow) {
+      const elapsed = Date.now() - new Date(sharedRow.lastAt).getTime()
+      if (elapsed < needMs) {
+        const remainingSec = Math.ceil((needMs - elapsed) / 1000)
+        return formatCooldownMessage(c, remainingSec)
+      }
+    }
+  }
 
-  const remainingSec = Math.ceil((needMs - elapsed) / 1000)
-  return formatCooldownMessage(c, remainingSec)
+  return null
 }
 
 export async function recordCommandCooldown(
@@ -336,6 +355,8 @@ export async function recordCommandCooldown(
   userId: string,
   commandName: string,
   cfg: PriorityCooldownConfig | undefined,
+  /** 当前用户绑定的 maiUid，用于跨账号共享冷却 */
+  maiUid?: string,
 ): Promise<void> {
   const c = cfg || {}
   if (!c.enabled) return
@@ -344,11 +365,24 @@ export async function recordCommandCooldown(
   if (!slot) return
 
   const now = new Date()
+
+  // 写入个人冷却键
   const existing = await ctx.database.get('maibot_user_cooldowns', { userId, slot })
   if (existing.length > 0) {
     await ctx.database.set('maibot_user_cooldowns', { userId, slot }, { lastAt: now })
   } else {
     await ctx.database.create('maibot_user_cooldowns', { userId, slot, lastAt: now })
+  }
+
+  // 同时写入 maiuid 共享冷却键
+  if (maiUid) {
+    const sharedKey = `maiuid:${maiUid}`
+    const sharedExisting = await ctx.database.get('maibot_user_cooldowns', { userId: sharedKey, slot })
+    if (sharedExisting.length > 0) {
+      await ctx.database.set('maibot_user_cooldowns', { userId: sharedKey, slot }, { lastAt: now })
+    } else {
+      await ctx.database.create('maibot_user_cooldowns', { userId: sharedKey, slot, lastAt: now })
+    }
   }
 }
 
