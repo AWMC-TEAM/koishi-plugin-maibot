@@ -1,5 +1,5 @@
 import { Context, Schema, Session } from 'koishi'
-import { MaiBotAPI } from './api'
+import { MaiBotAPI, debugContextStorage } from './api'
 import {
   formatBindChangeWaitHuman,
   msUntilBindChangeAllowed,
@@ -2336,11 +2336,36 @@ export function apply(ctx: Context, config: Config) {
 
   // 调试模式开启时，给 API 客户端注入请求/响应日志钩子
   if (debugEnabled) {
-    api.debugLogger = (tag, payload) => {
+    api.debugLogger = (tag, payload, fromDebugSession) => {
+      let text: string
       try {
-        logger.info(`[DEBUG API] ${tag}\n${JSON.stringify(payload, null, 2)}`)
+        text = JSON.stringify(payload, null, 2)
       } catch {
-        logger.info(`[DEBUG API] ${tag} ${String(payload)}`)
+        text = String(payload)
+      }
+      logger.info(`[DEBUG API] ${tag}\n${text}`)
+
+      // 仅当此次 API 调用源自调试群命令时，才把日志发到调试群
+      if (!fromDebugSession || debugGroupSet.size === 0) return
+
+      const truncated = text.length > 1500 ? text.slice(0, 1500) + '\n...(truncated)' : text
+      const msg = `[DEBUG API] ${tag}\n${truncated}`
+      for (const groupKey of debugGroupSet) {
+        let platform = ''
+        let guildId = groupKey
+        const colonIdx = groupKey.indexOf(':')
+        if (colonIdx > 0) {
+          platform = groupKey.slice(0, colonIdx)
+          guildId = groupKey.slice(colonIdx + 1)
+        }
+        const candidates = platform
+          ? ctx.bots.filter(b => String(b.platform || '').toLowerCase() === platform.toLowerCase())
+          : [...ctx.bots]
+        for (const bot of candidates) {
+          try {
+            void bot.sendMessage(guildId, msg).catch(() => { /* 忽略 */ })
+          } catch { /* 忽略 */ }
+        }
       }
     }
     logger.info('🔧 调试模式已开启，调试群：' + [...debugGroupSet].join(', '))
@@ -2376,6 +2401,17 @@ export function apply(ctx: Context, config: Config) {
   // 维护模式中间件：拦截所有 maibot 插件的命令
   // 注意：使用 before('command') 来确保不会拦截所有消息
   ctx.middleware(async (session, next) => {
+    // 调试群命令：用 AsyncLocalStorage 包裹整个处理链，
+    // 让后续 axios 调用能识别"此请求来自调试群"
+    const content = session.content?.trim() || ''
+    if (debugEnabled && content.match(/^\/?mai/i) && isDebugSession(session)) {
+      return debugContextStorage.run({ fromDebugSession: true }, async () => {
+        if (!maintenanceMode) return next()
+        // 调试群跳过维护拦截
+        return next()
+      })
+    }
+
     if (!maintenanceMode) {
       return next()
     }
@@ -2386,7 +2422,6 @@ export function apply(ctx: Context, config: Config) {
     }
     
     // 检查是否是 maibot 插件的命令（所有 mai 开头的命令，包括 maialert）
-    const content = session.content?.trim() || ''
     // 匹配所有 mai 开头的命令：/mai、mai、/maialert、maialert 等
     if (content.match(/^\/?mai/i)) {
       return maintenanceMessage

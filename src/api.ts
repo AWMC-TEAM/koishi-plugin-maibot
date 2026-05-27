@@ -1,4 +1,5 @@
 import axios, { AxiosInstance } from 'axios'
+import { AsyncLocalStorage } from 'async_hooks'
 
 export interface ApiConfig {
   baseURL: string
@@ -11,13 +12,21 @@ export interface ApiConfig {
   bearerToken?: string
 }
 
+/** 调试上下文：在 API 调用栈中传递「来源是否为调试会话」的标记 */
+export const debugContextStorage = new AsyncLocalStorage<{ fromDebugSession: boolean }>()
+
+/** 获取当前调用是否处于调试会话 */
+export function isFromDebugSession(): boolean {
+  return debugContextStorage.getStore()?.fromDebugSession === true
+}
+
 export class MaiBotAPI {
   private client: AxiosInstance
   private retryCount: number
   private retryDelay: number
   private apiStyle: 'team' | 'public'
-  /** 调试钩子：开启后打印每次 API 请求/响应详情；由 index.ts 注入 */
-  public debugLogger: ((tag: string, payload: any) => void) | null = null
+  /** 调试钩子：开启后打印每次 API 请求/响应详情；由 index.ts 注入。fromDebugSession 标记此次调用是否源自调试群命令 */
+  public debugLogger: ((tag: string, payload: any, fromDebugSession: boolean) => void) | null = null
 
   constructor(config: ApiConfig) {
     this.retryCount = config.retryCount ?? 5
@@ -44,6 +53,9 @@ export class MaiBotAPI {
         try {
           // 记录开始时间用于计算耗时
           ;(cfg as any).__startTime = Date.now()
+          // 把当前 AsyncLocalStorage 中的 fromDebugSession 标记冻结到 cfg 上，
+          // 避免响应/错误回调时已脱离该上下文（axios 拦截器内可能已不在 store 内）
+          ;(cfg as any).__fromDebugSession = isFromDebugSession()
           this.debugLogger('API REQUEST', {
             method: cfg.method?.toUpperCase(),
             baseURL: cfg.baseURL,
@@ -53,7 +65,7 @@ export class MaiBotAPI {
             data: cfg.data,
             headers: cfg.headers,
             timeout: cfg.timeout,
-          })
+          }, (cfg as any).__fromDebugSession === true)
         } catch { /* 忽略 */ }
       }
       return cfg
@@ -64,6 +76,7 @@ export class MaiBotAPI {
           try {
             const startTime = (response.config as any)?.__startTime
             const elapsed = startTime ? Date.now() - startTime : undefined
+            const fromDebug = (response.config as any)?.__fromDebugSession === true
             // 提取服务器 IP（部分平台支持）
             const remoteAddress = (response.request?.socket?.remoteAddress)
               || (response.request?.res?.connection?.remoteAddress)
@@ -87,7 +100,7 @@ export class MaiBotAPI {
               elapsedMs: elapsed,
               remoteAddress,
               remotePort,
-            })
+            }, fromDebug)
           } catch { /* 忽略 */ }
         }
         return response
@@ -98,6 +111,7 @@ export class MaiBotAPI {
             const cfg = error?.config
             const startTime = cfg?.__startTime
             const elapsed = startTime ? Date.now() - startTime : undefined
+            const fromDebug = cfg?.__fromDebugSession === true
             const remoteAddress = (error?.request?.socket?.remoteAddress)
               || (error?.response?.request?.socket?.remoteAddress)
               || (error?.request?.connection?.remoteAddress)
@@ -122,7 +136,7 @@ export class MaiBotAPI {
               elapsedMs: elapsed,
               remoteAddress,
               remotePort,
-            })
+            }, fromDebug)
           } catch { /* 忽略 */ }
         }
         return Promise.reject(error)
