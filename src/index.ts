@@ -78,6 +78,11 @@ export interface Config {
   maintenanceMessage?: string  // 维护模式提示消息
   hideLockAndProtection?: boolean  // 隐藏锁定模式和保护模式功能
   enableMaimile?: boolean  // 舞里程发放功能开关（默认关闭，API暂不可用）
+  debug?: {
+    enabled: boolean  // 调试模式开关
+    /** 调试群列表，支持 "platform:guildId"，默认 onebot:1094443807 */
+    groupIds: string[]
+  }
   whitelist?: {
     enabled: boolean  // 白名单开关
     guildIds: string[]  // 允许使用的群ID列表（兼容旧配置）
@@ -172,6 +177,13 @@ export const Config: Schema<Config> = Schema.object({
   maintenanceMessage: Schema.string().default('⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/').description('维护模式提示消息'),
   hideLockAndProtection: Schema.boolean().default(false).description('隐藏锁定模式和保护模式功能，开启后相关指令将不可用，状态信息也不会显示'),
   enableMaimile: Schema.boolean().default(false).description('舞里程发放功能开关（默认关闭，因API暂不可用）'),
+  debug: Schema.object({
+    enabled: Schema.boolean().default(false).description('调试模式开关：开启后调试群内跳过所有限制（冷却/队列/维护/白名单等），并打印详细日志'),
+    groupIds: Schema.array(Schema.string()).role('table').default(['onebot:1094443807']).description('调试群列表，支持 "platform:guildId"（如 onebot:1094443807）或仅 "guildId"'),
+  }).description('调试配置').default({
+    enabled: false,
+    groupIds: ['onebot:1094443807'],
+  }),
   whitelist: Schema.object({
     enabled: Schema.boolean().default(false).description('白名单开关，开启后只有白名单内的群可以使用Bot功能'),
     guildIds: Schema.array(Schema.string()).default(['1072033605']).description('允许使用Bot功能的群ID列表（兼容旧配置）'),
@@ -1173,9 +1185,13 @@ function processSGID(input: string): { qrText: string } | null {
 /**
  * 检查群是否在白名单中（如果白名单功能启用）
  */
-function checkWhitelist(session: Session | null, config: Config): { allowed: boolean; message?: string } {
+function checkWhitelist(session: Session | null, config: Config, debugBypass?: boolean): { allowed: boolean; message?: string } {
   if (!session) {
     return { allowed: true }  // 私聊允许
+  }
+
+  if (debugBypass) {
+    return { allowed: true }  // 调试群放行
   }
 
   const whitelistConfig = config.whitelist || { enabled: false, guildIds: [], targets: [], message: '' }
@@ -1857,8 +1873,14 @@ export function apply(ctx: Context, config: Config) {
     if (!priorityCooldownCfg?.enabled) return
     if (!isMaiPluginCommandName(cmdName)) return
     if (commandToCooldownSlot(cmdName) === null) return
-    const wl = checkWhitelist(sess, config)
+    const wl = checkWhitelist(sess, config, isDebugSession(sess))
     if (!wl.allowed) return
+
+    // 调试群完全跳过冷却 / 拦截
+    if (isDebugSession(sess)) {
+      debugLog(sess, `跳过冷却检查（调试群）：${cmdName}`)
+      return
+    }
 
     // 获取当前用户绑定的 maiUid（用于共享冷却）
     let sessionMaiUid: string | undefined
@@ -2121,6 +2143,12 @@ export function apply(ctx: Context, config: Config) {
       return sentMessageIds
     }
 
+    // 调试群跳过队列
+    if (isDebugSession(session)) {
+      debugLog(session, '跳过队列（调试群）')
+      return sentMessageIds
+    }
+
     // 检查必要的 session 属性
     if (!session.userId || !session.channelId) {
       logger.warn('无法加入队列：缺少 userId 或 channelId')
@@ -2254,6 +2282,55 @@ export function apply(ctx: Context, config: Config) {
   const maintenanceMessage = config.maintenanceMessage ?? '⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/'
   const hideLockAndProtection = config.hideLockAndProtection ?? false
   const enableMaimile = config.enableMaimile ?? false
+  const debugConfig = config.debug || { enabled: false, groupIds: ['onebot:1094443807'] }
+  const debugEnabled = debugConfig.enabled === true
+  const debugGroupSet = new Set((debugConfig.groupIds || []).map(s => String(s || '').trim()).filter(Boolean))
+
+  /** 当前会话是否在调试群内（且调试模式已开启） */
+  function isDebugSession(session: Session | null | undefined): boolean {
+    if (!debugEnabled || !session) return false
+    if (!session.guildId) return false
+    const platform = String(session.platform || '').trim().toLowerCase()
+    const guildId = String(session.guildId || '').trim()
+    const channelId = String(session.channelId || '').trim()
+    const candidates = [
+      guildId,
+      platform ? `${platform}:${guildId}` : '',
+      channelId,
+      platform && channelId ? `${platform}:${channelId}` : '',
+    ].filter(Boolean)
+    return candidates.some(c => debugGroupSet.has(c))
+  }
+
+  /** 调试日志（仅在调试模式生效） */
+  function debugLog(session: Session | null | undefined, label: string, data?: any): void {
+    if (!isDebugSession(session)) return
+    const prefix = `[DEBUG ${session?.platform || ''}:${session?.guildId || ''}/${session?.userId || ''}]`
+    if (data === undefined) {
+      logger.info(`${prefix} ${label}`)
+    } else {
+      try {
+        const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2)
+        logger.info(`${prefix} ${label}\n${text}`)
+      } catch {
+        logger.info(`${prefix} ${label} ${String(data)}`)
+      }
+    }
+  }
+  // 暴露给后续逻辑使用（避免未使用警告）
+  void debugLog
+
+  // 调试模式开启时，给 API 客户端注入请求/响应日志钩子
+  if (debugEnabled) {
+    api.debugLogger = (tag, payload) => {
+      try {
+        logger.info(`[DEBUG API] ${tag}\n${JSON.stringify(payload, null, 2)}`)
+      } catch {
+        logger.info(`[DEBUG API] ${tag} ${String(payload)}`)
+      }
+    }
+    logger.info('🔧 调试模式已开启，调试群：' + [...debugGroupSet].join(', '))
+  }
 
   // 创建使用配置的 promptYes 函数
   const promptYesWithConfig = async (session: Session, message: string, timeout?: number): Promise<boolean> => {
@@ -2286,6 +2363,11 @@ export function apply(ctx: Context, config: Config) {
   // 注意：使用 before('command') 来确保不会拦截所有消息
   ctx.middleware(async (session, next) => {
     if (!maintenanceMode) {
+      return next()
+    }
+
+    // 调试群跳过维护拦截
+    if (isDebugSession(session)) {
       return next()
     }
     
@@ -2321,6 +2403,11 @@ export function apply(ctx: Context, config: Config) {
     const content = session.content?.trim() || ''
     // 匹配所有 mai 开头的命令
     if (!content.match(/^\/?mai/i)) {
+      return next()
+    }
+
+    // 调试群跳过免责声明
+    if (isDebugSession(session)) {
       return next()
     }
 
@@ -2794,7 +2881,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -2997,7 +3084,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -3038,7 +3125,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -3078,7 +3165,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -3344,7 +3431,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -3383,7 +3470,7 @@ export function apply(ctx: Context, config: Config) {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -3449,7 +3536,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -3912,7 +3999,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -4027,7 +4114,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -4145,7 +4232,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -4396,7 +4483,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -4602,7 +4689,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -5048,7 +5135,7 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 无法获取会话信息'
       }
 
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -5076,7 +5163,7 @@ export function apply(ctx: Context, config: Config) {
         const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
 
         // 交互式选择收藏品类别
-        const itemKind = await promptCollectionType(session, 60000, enableMaimile ? [] : [13, 15])
+        const itemKind = await promptCollectionType(session, 60000, (enableMaimile || isDebugSession(session)) ? [] : [13, 15])
         if (itemKind === null) {
           return '操作已取消'
         }
@@ -5372,7 +5459,7 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 无法获取会话信息'
       }
 
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -5862,7 +5949,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 检查白名单
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -7246,7 +7333,7 @@ export function apply(ctx: Context, config: Config) {
     .usage(' /mai兑换卡密 <MAI-开头的卡密>  或发送 /mai兑换卡密 后在限时内粘贴卡密。群组卡请在目标群内兑换；解绑卡须先 /mai绑定。')
     .action(async ({ session }, code) => {
       if (!session) return '❌ 无法获取会话信息'
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -7520,7 +7607,7 @@ export function apply(ctx: Context, config: Config) {
   ctx.command('mai取消群组优先', '取消本群群组优先（仅群组卡兑换人）')
     .action(async ({ session }) => {
       if (!session) return '❌ 无法获取会话信息'
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -7534,7 +7621,7 @@ export function apply(ctx: Context, config: Config) {
   ctx.command('mai群组优先换绑', '发起将本群群组优先迁移到其他群（仅兑换人）')
     .action(async ({ session }) => {
       if (!session) return '❌ 无法获取会话信息'
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
@@ -7546,7 +7633,7 @@ export function apply(ctx: Context, config: Config) {
     .alias('mai群组优先换绑完成')
     .action(async ({ session }) => {
       if (!session) return '❌ 无法获取会话信息'
-      const whitelistCheck = checkWhitelist(session, config)
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }

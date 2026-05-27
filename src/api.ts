@@ -16,6 +16,8 @@ export class MaiBotAPI {
   private retryCount: number
   private retryDelay: number
   private apiStyle: 'team' | 'public'
+  /** 调试钩子：开启后打印每次 API 请求/响应详情；由 index.ts 注入 */
+  public debugLogger: ((tag: string, payload: any) => void) | null = null
 
   constructor(config: ApiConfig) {
     this.retryCount = config.retryCount ?? 5
@@ -33,6 +35,51 @@ export class MaiBotAPI {
       headers,
     })
     this.setupRetry()
+    this.setupDebugInterceptor()
+  }
+
+  private setupDebugInterceptor(): void {
+    this.client.interceptors.request.use((cfg) => {
+      if (this.debugLogger) {
+        try {
+          this.debugLogger('API REQUEST', {
+            method: cfg.method,
+            url: cfg.url,
+            params: cfg.params,
+            data: cfg.data,
+          })
+        } catch { /* 忽略 */ }
+      }
+      return cfg
+    })
+    this.client.interceptors.response.use(
+      (response) => {
+        if (this.debugLogger) {
+          try {
+            this.debugLogger('API RESPONSE', {
+              status: response.status,
+              url: response.config?.url,
+              data: response.data,
+            })
+          } catch { /* 忽略 */ }
+        }
+        return response
+      },
+      (error) => {
+        if (this.debugLogger) {
+          try {
+            this.debugLogger('API ERROR', {
+              code: error?.code,
+              status: error?.response?.status,
+              url: error?.config?.url,
+              message: error?.message,
+              data: error?.response?.data,
+            })
+          } catch { /* 忽略 */ }
+        }
+        return Promise.reject(error)
+      }
+    )
   }
 
   private setupRetry(): void {
