@@ -42,11 +42,17 @@ export class MaiBotAPI {
     this.client.interceptors.request.use((cfg) => {
       if (this.debugLogger) {
         try {
+          // 记录开始时间用于计算耗时
+          ;(cfg as any).__startTime = Date.now()
           this.debugLogger('API REQUEST', {
-            method: cfg.method,
+            method: cfg.method?.toUpperCase(),
+            baseURL: cfg.baseURL,
             url: cfg.url,
+            fullUrl: (cfg.baseURL || '') + (cfg.url || ''),
             params: cfg.params,
             data: cfg.data,
+            headers: cfg.headers,
+            timeout: cfg.timeout,
           })
         } catch { /* 忽略 */ }
       }
@@ -56,10 +62,31 @@ export class MaiBotAPI {
       (response) => {
         if (this.debugLogger) {
           try {
+            const startTime = (response.config as any)?.__startTime
+            const elapsed = startTime ? Date.now() - startTime : undefined
+            // 提取服务器 IP（部分平台支持）
+            const remoteAddress = (response.request?.socket?.remoteAddress)
+              || (response.request?.res?.connection?.remoteAddress)
+              || (response.request?.connection?.remoteAddress)
+              || undefined
+            const remotePort = (response.request?.socket?.remotePort)
+              || (response.request?.res?.connection?.remotePort)
+              || (response.request?.connection?.remotePort)
+              || undefined
             this.debugLogger('API RESPONSE', {
               status: response.status,
+              statusText: response.statusText,
+              method: response.config?.method?.toUpperCase(),
+              baseURL: response.config?.baseURL,
               url: response.config?.url,
+              fullUrl: (response.config?.baseURL || '') + (response.config?.url || ''),
+              params: response.config?.params,
+              requestData: response.config?.data,
+              responseHeaders: response.headers,
               data: response.data,
+              elapsedMs: elapsed,
+              remoteAddress,
+              remotePort,
             })
           } catch { /* 忽略 */ }
         }
@@ -68,12 +95,33 @@ export class MaiBotAPI {
       (error) => {
         if (this.debugLogger) {
           try {
+            const cfg = error?.config
+            const startTime = cfg?.__startTime
+            const elapsed = startTime ? Date.now() - startTime : undefined
+            const remoteAddress = (error?.request?.socket?.remoteAddress)
+              || (error?.response?.request?.socket?.remoteAddress)
+              || (error?.request?.connection?.remoteAddress)
+              || undefined
+            const remotePort = (error?.request?.socket?.remotePort)
+              || (error?.response?.request?.socket?.remotePort)
+              || (error?.request?.connection?.remotePort)
+              || undefined
             this.debugLogger('API ERROR', {
               code: error?.code,
               status: error?.response?.status,
-              url: error?.config?.url,
+              statusText: error?.response?.statusText,
+              method: cfg?.method?.toUpperCase(),
+              baseURL: cfg?.baseURL,
+              url: cfg?.url,
+              fullUrl: (cfg?.baseURL || '') + (cfg?.url || ''),
+              params: cfg?.params,
+              requestData: cfg?.data,
               message: error?.message,
+              responseHeaders: error?.response?.headers,
               data: error?.response?.data,
+              elapsedMs: elapsed,
+              remoteAddress,
+              remotePort,
             })
           } catch { /* 忽略 */ }
         }

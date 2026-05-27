@@ -2317,8 +2317,22 @@ export function apply(ctx: Context, config: Config) {
       }
     }
   }
+
+  /** 调试群里给失败消息附加详细诊断信息（API 返回原文）；非调试群返回空串 */
+  function debugDetailSuffix(session: Session | null | undefined, payload: any): string {
+    if (!isDebugSession(session)) return ''
+    try {
+      const json = JSON.stringify(payload, null, 2)
+      // 防止过长消息被截断
+      const trimmed = json.length > 1500 ? json.slice(0, 1500) + '\n...(truncated)' : json
+      return `\n\n[DEBUG] 服务器返回原文：\n${trimmed}`
+    } catch {
+      return `\n\n[DEBUG] 服务器返回原文：${String(payload)}`
+    }
+  }
   // 暴露给后续逻辑使用（避免未使用警告）
   void debugLog
+  void debugDetailSuffix
 
   // 调试模式开启时，给 API 客户端注入请求/响应日志钩子
   if (debugEnabled) {
@@ -4282,10 +4296,26 @@ export function apply(ctx: Context, config: Config) {
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
+        debugLog(session, 'mai发票 / qr_text 已获取', {
+          fromCache: qrTextResult.fromCache,
+          qrTextPrefix: qrTextResult.qrText?.substring(0, 12) + '...',
+          multiple,
+          targetUserId: binding.userId,
+          maiUid: maskUserId(binding.maiUid),
+        })
+
         // 在调用API前加入队列
         await waitForQueue(session)
 
         await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
+        debugLog(session, 'mai发票 / 准备调用 getTicket', {
+          regionId: isPublicApi ? undefined : machineInfo.regionId,
+          clientId: isPublicApi ? undefined : machineInfo.clientId,
+          placeId: isPublicApi ? undefined : machineInfo.placeId,
+          ticketId: multiple,
+          apiStyle: isPublicApi ? 'public' : 'team',
+          baseURL: config.apiBaseURL,
+        })
 
         // 使用新API获取功能票（需要qr_text）
         let ticketResult
@@ -4298,7 +4328,14 @@ export function apply(ctx: Context, config: Config) {
             multiple,
             qrTextResult.qrText
           )
+          debugLog(session, 'mai发票 / getTicket 返回（首次）', ticketResult)
         } catch (error: any) {
+          debugLog(session, 'mai发票 / getTicket 异常（首次）', {
+            code: error?.code,
+            status: error?.response?.status,
+            message: error?.message,
+            data: error?.response?.data,
+          })
           // 如果使用了缓存且失败，尝试重新获取SGID
           if (usedCache) {
             logger.info('使用缓存的SGID失败，尝试重新获取SGID')
@@ -4315,12 +4352,20 @@ export function apply(ctx: Context, config: Config) {
               multiple,
               retryQrText.qrText
             )
+            debugLog(session, 'mai发票 / getTicket 返回（异常重试）', ticketResult)
           } else {
             throw error
           }
         }
 
         if (!ticketResult.TicketStatus || !ticketResult.LoginStatus || !ticketResult.LogoutStatus) {
+          debugLog(session, 'mai发票 / 状态不全 true', {
+            TicketStatus: ticketResult.TicketStatus,
+            LoginStatus: ticketResult.LoginStatus,
+            LogoutStatus: ticketResult.LogoutStatus,
+            QrStatus: ticketResult.QrStatus,
+            usedCache,
+          })
           // 如果使用了缓存且失败，尝试重新获取SGID
           if (usedCache && (!ticketResult.QrStatus || ticketResult.LoginStatus === false)) {
             logger.info('使用缓存的SGID失败，尝试重新获取SGID')
@@ -4337,17 +4382,18 @@ export function apply(ctx: Context, config: Config) {
               multiple,
               retryQrText.qrText
             )
+            debugLog(session, 'mai发票 / getTicket 返回（缓存失败后重试）', ticketResult)
             if (!ticketResult.TicketStatus || !ticketResult.LoginStatus || !ticketResult.LogoutStatus) {
               if (!ticketResult.QrStatus || ticketResult.LoginStatus === false) {
-                return `❌ 发放功能票失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}`
+                return `❌ 发放功能票失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}${debugDetailSuffix(session, ticketResult)}`
               }
-              return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。'
+              return `❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。${debugDetailSuffix(session, ticketResult)}`
             }
           } else {
             if (!ticketResult.QrStatus || ticketResult.LoginStatus === false) {
-              return `❌ 发放功能票失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}`
+              return `❌ 发放功能票失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}${debugDetailSuffix(session, ticketResult)}`
             }
-            return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。'
+            return `❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。${debugDetailSuffix(session, ticketResult)}`
           }
         }
 
