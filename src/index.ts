@@ -2466,11 +2466,46 @@ export function apply(ctx: Context, config: Config) {
     
     // 获取目标用户的绑定
     logger.debug(`getTargetBinding: 查询目标用户 ${targetUserIdRaw} 的绑定`)
-    const bindings = await ctx.database.get('maibot_bindings', { userId: targetUserIdRaw })
-    logger.debug(`getTargetBinding: 目标用户绑定数量 = ${bindings.length}`)
+    // 收集候选键：原始ID + bind插件反查的同账号其他平台ID + koishi:<aid> 统一键
+    const candidates = new Set<string>([targetUserIdRaw])
+    const platform = session.platform ? String(session.platform) : ''
+    try {
+      const legacy = await getBindRelatedLegacyUserIdsForTarget(ctx, platform, targetUserIdRaw)
+      for (const id of legacy) candidates.add(id)
+    } catch { /* 忽略 */ }
+    // 反查 aid 得到 koishi:<aid>
+    const db = ctx.database as any
+    if (db && typeof db.get === 'function') {
+      try {
+        const pidCandidates = platform
+          ? [`${platform}:${targetUserIdRaw}`, targetUserIdRaw]
+          : [targetUserIdRaw]
+        let aid: number | string | undefined
+        for (const pid of pidCandidates) {
+          const rows = await db.get('binding', { pid })
+          if (rows?.length) {
+            aid = rows[0]?.aid
+            break
+          }
+        }
+        if (aid !== undefined && aid !== null) {
+          candidates.add(`koishi:${String(aid)}`)
+        }
+      } catch { /* 忽略 */ }
+    }
+
+    let bindings: UserBinding[] = []
+    for (const key of candidates) {
+      const rows = await ctx.database.get('maibot_bindings', { userId: key })
+      if (rows.length > 0) {
+        bindings = rows
+        break
+      }
+    }
+    logger.debug(`getTargetBinding: 候选键 = ${[...candidates].join(', ')}, 命中数量 = ${bindings.length}`)
     if (bindings.length === 0) {
       logger.warn(`getTargetBinding: 用户 ${targetUserIdRaw} 尚未绑定账号（原始输入: "${targetUserIdText}"）`)
-      return { binding: null, isProxy: true, error: `❌ 用户 ${targetUserIdRaw} 尚未绑定账号\n\n[Debug] 原始输入: "${targetUserIdText}"\n提取的ID: "${targetUserIdRaw}"\n请确认用户ID是否正确` }
+      return { binding: null, isProxy: true, error: `❌ 用户 ${targetUserIdRaw} 尚未绑定账号\n\n[Debug] 原始输入: "${targetUserIdText}"\n提取的ID: "${targetUserIdRaw}"\n候选键: ${[...candidates].join(', ')}\n请确认用户ID是否正确` }
     }
     
     logger.debug(`getTargetBinding: 成功获取目标用户 ${targetUserIdRaw} 的绑定`)
