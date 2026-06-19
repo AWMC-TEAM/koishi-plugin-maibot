@@ -3,7 +3,7 @@ import { Context } from 'koishi'
 export interface UserBinding {
   id: number
   userId: string  // 用户唯一键（优先 koishi:<id>，兼容旧平台原始ID）
-  maiUid: string  // 加密后的用户ID
+  maiUid: string  // 街机账号 UID（纯数字；老数据含字母会在扫码时自动迁移）
   qrCode: string  // 原始二维码（SGWCMAID...）
   bindTime: Date  // 绑定时间
   userName?: string  // 用户名（从preview获取）
@@ -20,6 +20,8 @@ export interface UserBinding {
   protectionMode?: boolean  // 是否开启保护模式
   lastQrCode?: string  // 最近输入的SGID（用于10分钟内缓存）
   lastQrCodeTime?: Date  // 最近输入SGID的时间戳
+  /** 最近一次 B50 上传是否成功；false 时禁用 SGID 缓存直至用户重新提供 */
+  lastQrUploadSuccess?: boolean
   /** 绑定时快照的玩家名，用于与每次 preview 校验 */
   boundPlayerName?: string
   /** 解绑卡兑换累计次数，冷却期内解绑时消耗 */
@@ -152,6 +154,7 @@ export function extendDatabase(ctx: Context) {
     protectionMode: 'boolean',  // 是否开启保护模式
     lastQrCode: 'string',  // 最近输入的SGID（用于10分钟内缓存）
     lastQrCodeTime: 'timestamp',  // 最近输入SGID的时间戳
+    lastQrUploadSuccess: 'boolean',
     boundPlayerName: 'string',
     unbindCredits: 'unsigned',
   }, {

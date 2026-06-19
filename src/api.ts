@@ -64,6 +64,91 @@ export function findMatchingChargeTask(
   })
 }
 
+export interface UserPreview {
+  UserID: string | number
+  BanState?: number
+  IsLogin?: boolean
+  LastLoginDate?: string
+  LastPlayDate?: string
+  LastPairLoginDate?: string
+  Rating?: number
+  PlayerOldRating?: number
+  PlayerNewRating?: number
+  UserName?: string
+  DataVersion?: string
+  RomVersion?: string
+  CourseRank?: number
+  ClassRank?: number
+  PlayCount?: number
+  CurrentPlayCount?: number
+  LastRegionName?: string
+  TotalAwake?: number
+}
+
+export function formatBanStateLabel(banState?: number): string {
+  if (banState === 0) return '正常'
+  if (banState === 1) return '警告'
+  if (banState === 2) return '封禁'
+  if (banState == null) return '未知'
+  return `异常(${banState})`
+}
+
+export function formatAccountStatusBlock(preview: UserPreview): string {
+  const ratingText = preview.Rating != null
+    ? (preview.PlayerOldRating != null && preview.PlayerNewRating != null
+      ? `${preview.Rating} (${preview.PlayerOldRating}+${preview.PlayerNewRating})`
+      : String(preview.Rating))
+    : '未知'
+
+  const lines = [
+    `用户名: ${preview.UserName || '未知'}`,
+    `Rating: ${ratingText}`,
+  ]
+  if (preview.ClassRank != null && preview.CourseRank != null) {
+    lines.push(`友人对战等级: ${preview.ClassRank}[${preview.CourseRank}]`)
+  }
+  if (preview.PlayCount != null) lines.push(`总游玩次数: ${preview.PlayCount}`)
+  if (preview.CurrentPlayCount != null) lines.push(`当前版本游玩次数: ${preview.CurrentPlayCount}`)
+  if (preview.RomVersion) lines.push(`机台版本: ${preview.RomVersion}`)
+  if (preview.DataVersion) lines.push(`数据版本: ${preview.DataVersion}`)
+  if (preview.LastLoginDate) lines.push(`上次登录: ${preview.LastLoginDate}`)
+  if (preview.LastPlayDate) lines.push(`上次游玩: ${preview.LastPlayDate}`)
+  if (preview.LastPairLoginDate) lines.push(`上次拼机: ${preview.LastPairLoginDate}`)
+  if (preview.LastRegionName) lines.push(`上次游玩区域: ${preview.LastRegionName}`)
+  if (preview.TotalAwake != null) lines.push(`总觉醒次数: ${preview.TotalAwake}`)
+  lines.push(`封禁状态: ${formatBanStateLabel(preview.BanState)}`)
+
+  return `\n📊 账号信息：\n${lines.join('\n')}\n`
+}
+
+export interface ChargeResult {
+  ChargeStatus: boolean
+  LoginStatus: boolean
+  LogoutStatus: boolean
+  QrStatus: boolean
+  userChargeList?: Array<{
+    chargeId: number
+    extNum1: number
+    purchaseDate: string
+    stock: number
+    validDate: string
+  }>
+  userFreeChargeList?: Array<{
+    chargeId: number
+    stock: number
+  }>
+}
+
+export interface GetPreviewOptions {
+  regionId?: number
+  placeId?: number
+  token?: string
+}
+
+export interface GetChargeOptions {
+  userId?: string
+}
+
 export function formatChargeTaskStatus(task: ChargeQueueTask): string {
   const statusLabel: Record<ChargeQueueTask['status'], string> = {
     pending: '排队中',
@@ -220,10 +305,15 @@ export class MaiBotAPI {
         }
 
         const shouldRetry =
-          error?.code === 'ECONNRESET' || error?.response?.status === 504
+          error?.code === 'ECONNRESET'
+          || error?.code === 'ETIMEDOUT'
+          || error?.response?.status === 429
+          || (error?.response?.status != null && error.response.status >= 500)
+
+        const maxRetries = (originalConfig as { __swUserApiMaxRetries?: number }).__swUserApiMaxRetries ?? this.retryCount
 
         const currentRetry = originalConfig.__retryCount ?? 0
-        if (!shouldRetry || currentRetry >= this.retryCount) {
+        if (!shouldRetry || currentRetry >= maxRetries) {
           return Promise.reject(error)
         }
 
@@ -238,6 +328,10 @@ export class MaiBotAPI {
 
   private swPath(suffix: string): string {
     return `/awmc/api/v1${suffix}`
+  }
+
+  private swQrBody(qrcode: string, keychip: string): Record<string, unknown> {
+    return { qrcode, keychip }
   }
 
   private swKeychipBody(
@@ -258,6 +352,142 @@ export class MaiBotAPI {
       || err.response?.data?.msg
       || err.message
       || '未知错误'
+  }
+
+  private parseSwWrappedResponse(data: unknown): Record<string, unknown> {
+    if (data == null || typeof data !== 'object') {
+      return {}
+    }
+    const record = data as Record<string, unknown>
+    if (record.userId != null || record.userData != null) {
+      return record
+    }
+    if (record.code != null && Number(record.code) < 0) {
+      throw new Error(String(record.msg || record.error || 'sw-api 请求失败'))
+    }
+    if (record.error != null && record.code == null) {
+      throw new Error(String(record.error))
+    }
+    if (record.msg != null) {
+      if (typeof record.msg === 'object') {
+        return record.msg as Record<string, unknown>
+      }
+      if (typeof record.msg === 'string' && record.msg.trim()) {
+        try {
+          return JSON.parse(record.msg) as Record<string, unknown>
+        } catch {
+          throw new Error(`sw-api 响应解析失败: ${record.msg}`)
+        }
+      }
+    }
+    return record
+  }
+
+  /** team 用户类接口（user/data、user/charge）最多重试 3 次 */
+  private static readonly SW_USER_API_RETRIES = 3
+  private static readonly SW_USER_DATA_TIMEOUT_MS = 120000
+
+  private async postSwUserApi(
+    path: string,
+    body: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<Record<string, unknown>> {
+    const response = await this.client.post(this.swPath(path), body, {
+      timeout: timeoutMs ?? this.client.defaults.timeout,
+      __swUserApiMaxRetries: MaiBotAPI.SW_USER_API_RETRIES,
+    } as any)
+    return this.parseSwWrappedResponse(response.data)
+  }
+
+  private numField(raw: Record<string, unknown>, ...keys: string[]): number | undefined {
+    for (const key of keys) {
+      const v = raw[key]
+      if (typeof v === 'number' && !Number.isNaN(v)) return v
+      if (v != null && v !== '') {
+        const n = Number(v)
+        if (!Number.isNaN(n)) return n
+      }
+    }
+    return undefined
+  }
+
+  private normalizePreviewFromPayload(raw: Record<string, unknown>): UserPreview {
+    const ud = (raw.userData ?? raw.userPreview ?? raw.userPreviewData ?? raw) as Record<string, unknown>
+    const userId = raw.userId ?? raw.UserID ?? ud.userId ?? ud.UserID ?? ud.userID
+    const returnCode = raw.returnCode ?? ud.returnCode
+    if (returnCode === 0 || returnCode === -1 || userId === -1 || userId === '-1') {
+      return { UserID: -1 }
+    }
+    if (userId == null) {
+      return { UserID: -1 }
+    }
+
+    const banState = this.numField(raw, 'banState', 'BanState')
+      ?? this.numField(ud, 'banState', 'BanState')
+    const isLogin = ud.isLogin ?? ud.IsLogin
+
+    return {
+      UserID: userId as string | number,
+      BanState: banState,
+      IsLogin: typeof isLogin === 'boolean' ? isLogin : undefined,
+      LastLoginDate: (ud.lastLoginDate ?? ud.LastLoginDate) as string | undefined,
+      LastPlayDate: (ud.lastPlayDate ?? ud.LastPlayDate) as string | undefined,
+      LastPairLoginDate: (ud.lastPairLoginDate ?? ud.LastPairLoginDate) as string | undefined,
+      Rating: this.numField(ud, 'playerRating', 'PlayerRating', 'Rating', 'rating'),
+      PlayerOldRating: this.numField(ud, 'playerOldRating', 'PlayerOldRating'),
+      PlayerNewRating: this.numField(ud, 'playerNewRating', 'PlayerNewRating'),
+      UserName: (ud.userName ?? ud.UserName) as string | undefined,
+      DataVersion: (ud.lastDataVersion ?? ud.LastDataVersion ?? ud.dataVersion ?? ud.DataVersion) as string | undefined,
+      RomVersion: (ud.lastRomVersion ?? ud.LastRomVersion ?? ud.romVersion ?? ud.RomVersion) as string | undefined,
+      CourseRank: this.numField(ud, 'courseRank', 'CourseRank'),
+      ClassRank: this.numField(ud, 'classRank', 'ClassRank'),
+      PlayCount: this.numField(ud, 'playCount', 'PlayCount'),
+      CurrentPlayCount: this.numField(ud, 'currentPlayCount', 'CurrentPlayCount'),
+      LastRegionName: (ud.lastRegionName ?? ud.LastRegionName) as string | undefined,
+      TotalAwake: this.numField(ud, 'totalAwake', 'TotalAwake'),
+    }
+  }
+
+  private normalizeChargeFromPayload(raw: Record<string, unknown>): ChargeResult {
+    const ud = (raw.userCharge ?? raw) as Record<string, unknown>
+    const returnCode = this.numField(raw, 'returnCode', 'ReturnCode')
+      ?? this.numField(ud, 'returnCode', 'ReturnCode')
+    const chargeStatus = ud.chargeStatus ?? ud.ChargeStatus ?? raw.chargeStatus ?? raw.ChargeStatus
+    const loginStatus = ud.loginStatus ?? ud.LoginStatus ?? raw.loginStatus ?? raw.LoginStatus
+    const logoutStatus = ud.logoutStatus ?? ud.LogoutStatus ?? raw.logoutStatus ?? raw.LogoutStatus
+    const qrStatus = ud.qrStatus ?? ud.QrStatus ?? raw.qrStatus ?? raw.QrStatus
+
+    const normalizeTicketList = (list: unknown) => {
+      if (!Array.isArray(list)) return undefined
+      return list.map((t: Record<string, unknown>) => ({
+        chargeId: Number(t.chargeId ?? t.ChargeId ?? 0),
+        extNum1: Number(t.extNum1 ?? t.ExtNum1 ?? 0),
+        purchaseDate: String(t.purchaseDate ?? t.PurchaseDate ?? ''),
+        stock: Number(t.stock ?? t.Stock ?? 0),
+        validDate: String(t.validDate ?? t.ValidDate ?? ''),
+      }))
+    }
+
+    const normalizeFreeTicketList = (list: unknown) => {
+      if (!Array.isArray(list)) return undefined
+      return list.map((t: Record<string, unknown>) => ({
+        chargeId: Number(t.chargeId ?? t.ChargeId ?? 0),
+        stock: Number(t.stock ?? t.Stock ?? 0),
+      }))
+    }
+
+    const userChargeList = ud.userChargeList ?? ud.UserChargeList ?? raw.userChargeList ?? raw.UserChargeList
+    const userFreeChargeList =
+      ud.userFreeChargeList ?? ud.UserFreeChargeList ?? raw.userFreeChargeList ?? raw.UserFreeChargeList
+
+    return {
+      ChargeStatus: chargeStatus === true || chargeStatus === 1 || returnCode === 1,
+      LoginStatus: loginStatus === true || loginStatus === 1,
+      LogoutStatus: logoutStatus === true || logoutStatus === 1,
+      QrStatus: qrStatus === true || qrStatus === 1,
+      userChargeList: normalizeTicketList(userChargeList),
+      userFreeChargeList: normalizeFreeTicketList(userFreeChargeList),
+    }
   }
 
   /** sw-api 同步 B50 上传可能耗时较长 */
@@ -284,27 +514,29 @@ export class MaiBotAPI {
 
   /**
    * 查看用户信息（预览）
-   * GET /api/public/get_preview
-   * 需要: client_id, qr_text
+   * public: GET /v1/get_preview?qr_text=...
+   * team: POST /awmc/api/v1/user/data（仅 qrcode + keychip，扫码拉取账号信息）
    */
-  async getPreview(clientId: string, qrText: string): Promise<{
-    UserID: string | number
-    BanState?: number
-    IsLogin?: boolean
-    LastLoginDate?: string
-    LastPlayDate?: string
-    Rating?: number
-    UserName?: string
-    DataVersion?: string
-    RomVersion?: string
-  }> {
-    const path = this.apiStyle === 'public' ? '/v1/get_preview' : '/api/public/get_preview'
-    const params =
-      this.apiStyle === 'public'
-        ? { qr_text: qrText }
-        : { client_id: clientId, qr_text: qrText }
-    const response = await this.client.get(path, { params })
-    return response.data
+  async getPreview(
+    clientId: string,
+    qrText: string,
+    _options?: GetPreviewOptions,
+  ): Promise<UserPreview> {
+    if (this.apiStyle === 'public') {
+      if (!qrText) throw new Error('getPreview 需要 qr_text')
+      const response = await this.client.get('/v1/get_preview', { params: { qr_text: qrText } })
+      return response.data
+    }
+
+    if (!qrText) {
+      throw new Error('team 模式请提供二维码查询账号信息')
+    }
+    const raw = await this.postSwUserApi(
+      '/user/data',
+      this.swQrBody(qrText, clientId),
+      MaiBotAPI.SW_USER_DATA_TIMEOUT_MS,
+    )
+    return this.normalizePreviewFromPayload(raw)
   }
 
   /**
@@ -356,7 +588,7 @@ export class MaiBotAPI {
   /**
    * 查询水鱼 B50 任务状态
    * GET /api/public/get_b50_task_status
-   * 需要: mai_uid (加密的用户ID)
+   * 需要: mai_uid
    */
   async getB50TaskStatus(maiUid: string): Promise<{
     code: number
@@ -448,7 +680,7 @@ export class MaiBotAPI {
   /**
    * 查询落雪 B50 任务状态
    * GET /api/public/get_lx_b50_task_status
-   * 需要: mai_uid (加密的用户ID)
+   * 需要: mai_uid
    */
   async getLxB50TaskStatus(maiUid: string): Promise<{
     code: number
@@ -663,43 +895,43 @@ export class MaiBotAPI {
 
   /**
    * 获取用户功能票
-   * GET /api/public/get_charge
-   * 需要: region_id, client_id, place_id, qr_text
+   * public: GET /v1/get_charge?qr_text=...
+   * team: POST /awmc/api/v1/user/charge（userId + keychip）
    */
   async getCharge(
     regionId: number,
     clientId: string,
     placeId: number,
-    qrText: string
-  ): Promise<{
-    ChargeStatus: boolean
-    LoginStatus: boolean
-    LogoutStatus: boolean
-    QrStatus: boolean
-    userChargeList?: Array<{
-      chargeId: number
-      extNum1: number
-      purchaseDate: string
-      stock: number
-      validDate: string
-    }>
-    userFreeChargeList?: Array<{
-      chargeId: number
-      stock: number
-    }>
-  }> {
-    const path = this.apiStyle === 'public' ? '/v1/get_charge' : '/api/public/get_charge'
-    const params =
-      this.apiStyle === 'public'
-        ? { qr_text: qrText }
-        : {
-            region_id: regionId,
-            client_id: clientId,
-            place_id: placeId,
-            qr_text: qrText,
-          }
-    const response = await this.client.get(path, { params })
-    return response.data
+    qrText: string,
+    options?: GetChargeOptions,
+  ): Promise<ChargeResult> {
+    if (this.apiStyle === 'public') {
+      const response = await this.client.get('/v1/get_charge', { params: { qr_text: qrText } })
+      return response.data
+    }
+
+    let userId = options?.userId
+    if (!userId && qrText) {
+      const preview = await this.getPreview(clientId, qrText, { regionId, placeId })
+      if (preview.UserID === -1 || preview.UserID === '-1') {
+        return {
+          ChargeStatus: false,
+          LoginStatus: false,
+          LogoutStatus: false,
+          QrStatus: false,
+        }
+      }
+      userId = String(preview.UserID)
+    }
+    if (!userId) {
+      throw new Error('team 模式 getCharge 需要 userId 或 qrcode')
+    }
+
+    const raw = await this.postSwUserApi('/user/charge', {
+      userId,
+      keychip: clientId,
+    })
+    return this.normalizeChargeFromPayload(raw)
   }
 
   /**

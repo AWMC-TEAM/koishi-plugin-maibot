@@ -84,7 +84,6 @@ export function commandToCooldownSlot(commandName: string): string | null {
   ])
   if (excluded.has(base)) return null
   if (base.startsWith('mai管理员')) return null
-  if (base === 'maialert' || base.startsWith('maialert')) return null
   if (base === 'maibypass') return null
 
   if (base === 'mai发票') return 'ticket'

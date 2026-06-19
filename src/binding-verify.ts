@@ -83,9 +83,29 @@ export function normalizePreviewUserId(userId: string | number): string {
   return String(userId)
 }
 
-/** 老版本密钥存库的 maiUid 常见以 Base64 前缀 MDk（即 ASCII「097…」）开头 */
+/** 新版本 maiUid 为纯数字 */
+export function isNumericMaiUid(uid: string): boolean {
+  return /^\d+$/.test(String(uid).trim())
+}
+
+/** 老版本存库的 maiUid 含英文字符（如 Base64 前缀 MDk…），需迁移到纯数字 UID */
+export function isLegacyLetterMaiUid(boundUid: string): boolean {
+  const s = String(boundUid).trim()
+  if (!s) return false
+  return /[A-Za-z]/.test(s)
+}
+
+/** @deprecated 使用 isLegacyLetterMaiUid */
 export function isLegacyMdkMaiUid(boundUid: string): boolean {
-  return String(boundUid).startsWith('MDk')
+  return isLegacyLetterMaiUid(boundUid)
+}
+
+export function formatBindingPlayerLabel(binding: {
+  userName?: string
+  boundPlayerName?: string
+}): string {
+  const name = binding.boundPlayerName?.trim() || binding.userName?.trim()
+  return name || '您的账号'
 }
 
 export type VerifyPreviewBindingResult =
@@ -98,8 +118,8 @@ export type VerifyPreviewBindingResult =
     }
 
 /**
- * 校验 preview 与绑定是否为同一街机账号：比较绑定记录的 maiUid 与二维码 preview 的 UserID。
- * 绑定为老格式（maiUid 以 MDk 开头）且与二维码 UID 不一致时，视为同账号升级格式，返回 ok + 迁移信息（由调用方写库并提示）。
+ * 校验二维码 preview 与绑定是否为同一街机账号。
+ * 不向用户展示 UID；老格式（含英文字符）自动迁移为 preview 中的纯数字 UID。
  */
 export function verifyPreviewMatchesBinding(
   binding: UserBinding,
@@ -109,27 +129,43 @@ export function verifyPreviewMatchesBinding(
   if (pid === '-1' || preview.UserID === -1) {
     return { ok: false, message: '❌ 无效或过期的二维码，无法完成验证。请重新获取玩家二维码后重试。' }
   }
-  const boundUid = String(binding.maiUid)
-  if (boundUid === pid) {
-    return { ok: true }
+  if (!isNumericMaiUid(pid)) {
+    return { ok: false, message: '❌ 无法识别账号信息，请重新获取玩家二维码后重试。' }
   }
-  if (isLegacyMdkMaiUid(boundUid)) {
+
+  const boundUid = String(binding.maiUid || '').trim()
+  if (!boundUid || isLegacyLetterMaiUid(boundUid)) {
     return {
       ok: true,
       migratedToUid: pid,
-      notice:
-        `💾 街机账号 UID 不一致：\n` +
-        `• 当前绑定记录的 UID：${boundUid}\n` +
-        `• 当前二维码对应的 UID：${pid}\n` +
-        `已为您自动迁移到新格式。`,
+      notice: boundUid && isLegacyLetterMaiUid(boundUid)
+        ? '💾 已为您自动更新账号信息。'
+        : undefined,
     }
   }
+
+  if (boundUid === pid) {
+    return { ok: true }
+  }
+
+  const previewName = preview.UserName?.trim()
+  const boundName = binding.boundPlayerName?.trim() || binding.userName?.trim()
+  if (previewName && boundName && previewName === boundName) {
+    return {
+      ok: true,
+      migratedToUid: pid,
+      notice: '💾 已为您自动更新账号信息。',
+    }
+  }
+
+  const boundLabel = formatBindingPlayerLabel(binding)
+  const previewLabel = previewName || '当前二维码对应账号'
   return {
     ok: false,
     message:
-      `❌ 街机账号 UID 不一致：\n` +
-      `• 当前绑定记录的 UID：${boundUid}\n` +
-      `• 当前二维码对应的 UID：${pid}\n` +
+      `❌ 当前二维码与绑定账号不一致：\n` +
+      `• 绑定玩家：${boundLabel}\n` +
+      `• 二维码玩家：${previewLabel}\n` +
       `若您已更换游戏账号，请使用 /mai解绑 后重新绑定（换绑冷却期内请使用 /mai解绑卡）。`,
   }
 }

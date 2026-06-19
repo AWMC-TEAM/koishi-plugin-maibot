@@ -1,6 +1,9 @@
 import { Context, h, Schema, Session, type Fragment } from 'koishi'
 import {
+  ChargeResult,
   MaiBotAPI,
+  UserPreview,
+  formatAccountStatusBlock,
   findMatchingChargeTask,
   formatChargeTaskStatus,
   isSyncB50Upload,
@@ -16,6 +19,8 @@ import {
   purgeInvalidLxnsBindings,
   clearUserLxnsBinding,
   LXNS_TOKEN_HINT_URL,
+  formatBindingPlayerLabel,
+  isNumericMaiUid,
   verifyPreviewMatchesBinding,
   type VerifyPreviewBindingResult,
 } from './binding-verify'
@@ -91,14 +96,6 @@ export interface Config {
     endHour: number
     message: string
   }
-  alertMessages?: {
-    loginMessage: string  // 上线消息
-    logoutMessage: string  // 下线消息
-  }
-  alertCheckInterval?: number  // 检查间隔（毫秒）
-  alertConcurrency?: number  // 并发检查数量
-  lockRefreshDelay?: number  // 锁定账号刷新时每次 login 的延迟（毫秒）
-  lockRefreshConcurrency?: number  // 锁定账号刷新时的并发数
   confirmTimeout?: number  // 确认提示超时时间（毫秒）
   rebindTimeout?: number  // 重新绑定超时时间（毫秒），默认60秒
   sgidCacheMinutes?: number  // SGID缓存有效期（分钟），默认10分钟
@@ -207,17 +204,6 @@ export const Config: Schema<Config> = Schema.object({
     endHour: 7,
     message: '当前为凌立服务器维护时间，本指令暂不可用，请稍后再试。',
   }),
-  alertMessages: Schema.object({
-    loginMessage: Schema.string().default('{playerid}{at} 你的账号已上线。').description('账号上线时的提示消息（支持占位符：{playerid} 玩家名，{at} @用户）'),
-    logoutMessage: Schema.string().default('{playerid}{at} 你的账号已下线。').description('账号下线时的提示消息（支持占位符：{playerid} 玩家名，{at} @用户）'),
-  }).description('账号状态提醒消息配置').default({
-    loginMessage: '{playerid}{at} 你的账号已上线。',
-    logoutMessage: '{playerid}{at} 你的账号已下线。',
-  }),
-  alertCheckInterval: Schema.number().default(60000).description('账号状态检查间隔（毫秒），默认60秒（60000毫秒）'),
-  alertConcurrency: Schema.number().default(3).description('并发检查数量，默认3个用户同时检查'),
-  lockRefreshDelay: Schema.number().default(1000).description('锁定账号刷新时每次 login 的延迟（毫秒），默认1秒（1000毫秒）'),
-  lockRefreshConcurrency: Schema.number().default(3).description('锁定账号刷新时的并发数，默认3个账号同时刷新'),
   confirmTimeout: Schema.number().default(10000).description('确认提示超时时间（毫秒），默认10秒（10000毫秒）'),
   rebindTimeout: Schema.number().default(60000).description('重新绑定超时时间（毫秒），默认60秒（60000毫秒）'),
   sgidCacheMinutes: Schema.number().default(10).description('SGID缓存有效期（分钟），默认10分钟（0表示禁用缓存）'),
@@ -271,7 +257,7 @@ export const Config: Schema<Config> = Schema.object({
   authLevelForCardAdmin: Schema.number().default(4).description('卡密管理指令（生成/删除/导出）需要的 Koishi authority，默认 4'),
   priorityCooldown: Schema.object({
     enabled: Schema.boolean().default(false).description(
-      '开启后，对参与冷却槽的 mai 指令在指令执行前统一检查间隔（见插件内 commandToCooldownSlot：含发票/B50/状态等分槽，其余多数为 default 槽；帮助、绑定类、maialert、管理员指令等不参与）',
+      '开启后，对参与冷却槽的 mai 指令在指令执行前统一检查间隔（见插件内 commandToCooldownSlot：含发票/B50/状态等分槽，其余多数为 default 槽；帮助、绑定类、管理员指令等不参与）',
     ),
     adminBypassAuthority: Schema.number()
       .default(4)
@@ -370,19 +356,6 @@ const TICKET_NAME_MAP: Record<number, string> = {
  */
 function getTicketName(chargeId: number): string {
   return TICKET_NAME_MAP[chargeId] || `未知票券(${chargeId})`
-}
-
-/**
- * 隐藏用户ID，只显示部分信息（防止盗号）
- */
-function maskUserId(uid: string): string {
-  if (!uid || uid.length <= 8) {
-    return '***'
-  }
-  // 显示前4位和后4位，中间用***代替
-  const start = uid.substring(0, 4)
-  const end = uid.substring(uid.length - 4)
-  return `${start}***${end}`
 }
 
 /**
@@ -1813,7 +1786,7 @@ async function waitForUserReply(
   })
 }
 
-/** 处理 preview 校验结果：拦截错误、老 MDk* maiUid 自动迁移并同步内存中的 binding */
+/** 处理 preview 校验结果：拦截错误、老格式 maiUid 自动迁移为纯数字并同步内存中的 binding */
 async function applyVerifyPreviewBinding(
   ctx: Context,
   binding: UserBinding,
@@ -1826,10 +1799,17 @@ async function applyVerifyPreviewBinding(
   if ('migratedToUid' in result) {
     await ctx.database.set('maibot_bindings', { userId: binding.userId }, { maiUid: result.migratedToUid })
     ;(binding as UserBinding).maiUid = result.migratedToUid
-    logger.info(`maiUid 老格式(MDk*) 已自动迁移 userId=${binding.userId}`)
+    logger.info(`maiUid 已自动迁移为数字格式 bindingUserId=${binding.userId}`)
     return { blocked: false, migrationNotice: result.notice }
   }
   return { blocked: false }
+}
+
+/**
+ * 标记最近一次 B50 类上传使用的 SGID 是否成功（影响 SGID 缓存）
+ */
+async function setQrUploadSuccessFlag(ctx: Context, bindingUserId: string, success: boolean | undefined): Promise<void> {
+  await ctx.database.set('maibot_bindings', { userId: bindingUserId }, { lastQrUploadSuccess: success })
 }
 
 /**
@@ -1852,7 +1832,11 @@ async function getQrText(
 
   // 如果启用缓存且binding存在，检查是否有缓存（非 Token 模式会用 preview 校验身份）
   const cacheMinutes = config.sgidCacheMinutes ?? 10
-  if (useCache && cacheMinutes > 0 && binding && binding.lastQrCode && binding.lastQrCodeTime) {
+  const cacheBlockedByFailedUpload = binding?.lastQrUploadSuccess === false
+  if (cacheBlockedByFailedUpload) {
+    logger.info('上次 B50 上传未成功，跳过 SGID 缓存，需用户重新提供')
+  }
+  if (!cacheBlockedByFailedUpload && useCache && cacheMinutes > 0 && binding && binding.lastQrCode && binding.lastQrCodeTime) {
     const cacheAge = Date.now() - new Date(binding.lastQrCodeTime).getTime()
     const cacheValidDuration = cacheMinutes * 60 * 1000
     
@@ -2619,56 +2603,7 @@ export function apply(ctx: Context, config: Config) {
     }
   })
 
-  // 登录播报功能全局开关（管理员可控制）
-  let alertFeatureEnabled = true
-
-  // 从数据库加载/初始化管理员全局开关（保证重启不丢）
-  const ALERT_FEATURE_KEY = 'alertFeatureEnabled'
-  const loadAlertFeatureEnabled = async () => {
-    try {
-      const rows = await ctx.database.get('maibot_settings', { key: ALERT_FEATURE_KEY })
-      if (rows.length > 0) {
-        alertFeatureEnabled = rows[0].boolValue ?? true
-        logger.info(`已从数据库加载登录播报全局开关: ${alertFeatureEnabled ? '开启' : '关闭'}`)
-        return
-      }
-      await ctx.database.create('maibot_settings', {
-        key: ALERT_FEATURE_KEY,
-        boolValue: true,
-        updatedAt: new Date(),
-      })
-      alertFeatureEnabled = true
-      logger.info('已初始化登录播报全局开关为开启（写入数据库默认值）')
-    } catch (e) {
-      // 兜底：数据库异常不阻塞插件运行，继续使用内存默认值
-      logger.warn('加载登录播报全局开关失败，将使用默认值 true：', e)
-      alertFeatureEnabled = true
-    }
-  }
-
-  const saveAlertFeatureEnabled = async (value: boolean) => {
-    alertFeatureEnabled = value
-    try {
-      const rows = await ctx.database.get('maibot_settings', { key: ALERT_FEATURE_KEY })
-      if (rows.length > 0) {
-        await ctx.database.set('maibot_settings', { key: ALERT_FEATURE_KEY }, {
-          boolValue: value,
-          updatedAt: new Date(),
-        })
-      } else {
-        await ctx.database.create('maibot_settings', {
-          key: ALERT_FEATURE_KEY,
-          boolValue: value,
-          updatedAt: new Date(),
-        })
-      }
-    } catch (e) {
-      logger.warn('保存登录播报全局开关失败（已更新内存状态）：', e)
-    }
-  }
-
-  // 插件启动后异步加载一次
-  void loadAlertFeatureEnabled()
+  // 登录播报功能已移除
 
   // 使用配置中的值（public 模式下 machineInfo 为占位，仅供类型兼容；网关请求不携带这些字段）
   const machineInfo: MachineInfo =
@@ -2843,7 +2778,7 @@ export function apply(ctx: Context, config: Config) {
       return next()
     }
     
-    // 检查是否是 maibot 插件的命令（所有 mai 开头的命令，包括 maialert）
+    // 检查是否是 maibot 插件的命令（所有 mai 开头的命令）
     if (isMaiUserMessage(session)) {
       return maintenanceMessage
     }
@@ -3002,11 +2937,10 @@ export function apply(ctx: Context, config: Config) {
 
     const baseCmd = getMaiCommandName(session)
     const publicApiExempt = new Set([
-      'mai', 'mai帮助', 'maialert', 'mai兑换卡密', 'maiSGID获取', 'SGID获取',
+      'mai', 'mai帮助', 'mai兑换卡密', 'maiSGID获取', 'SGID获取',
     ])
     if (
       publicApiExempt.has(baseCmd)
-      || baseCmd.startsWith('maialert')
       || baseCmd.startsWith('mai管理员')
       || baseCmd === 'maibypass'
     ) {
@@ -3043,8 +2977,8 @@ export function apply(ctx: Context, config: Config) {
     }
 
     const baseCmd = getMaiCommandName(session)
-    const betaExempt = new Set(['mai', 'mai帮助', 'maiping', 'maiqueue', 'maialert', 'mai兑换卡密', 'maiSGID获取', 'SGID获取'])
-    if (betaExempt.has(baseCmd) || baseCmd.startsWith('maialert') || baseCmd.startsWith('mai管理员') || baseCmd === 'maibypass') {
+    const betaExempt = new Set(['mai', 'mai帮助', 'maiping', 'maiqueue', 'mai兑换卡密', 'maiSGID获取', 'SGID获取'])
+    if (betaExempt.has(baseCmd) || baseCmd.startsWith('mai管理员') || baseCmd === 'maibypass') {
       return next()
     }
 
@@ -3087,8 +3021,8 @@ export function apply(ctx: Context, config: Config) {
     }
 
     const baseCmd = getMaiCommandName(session)
-    const termsExempt = new Set(['mai', 'mai帮助', 'maiping', 'maiqueue', 'maialert', 'mai兑换卡密', 'maiSGID获取', 'SGID获取'])
-    if (termsExempt.has(baseCmd) || baseCmd.startsWith('maialert') || baseCmd.startsWith('mai管理员') || baseCmd === 'maibypass') {
+    const termsExempt = new Set(['mai', 'mai帮助', 'maiping', 'maiqueue', 'mai兑换卡密', 'maiSGID获取', 'SGID获取'])
+    if (termsExempt.has(baseCmd) || baseCmd.startsWith('mai管理员') || baseCmd === 'maibypass') {
       return next()
     }
 
@@ -3908,16 +3842,6 @@ export function apply(ctx: Context, config: Config) {
   /mai取消群组优先 — 在群内，群组卡兑换人可取消本群群组优先
   /mai群组优先换绑 — 在原群发起，再在目标群发 /mai群组优先换入（兑换人迁移授权）`
 
-      helpText += `
-
-🔔 提醒功能：
-  /maialert [on|off] - 开关账号状态播报功能`
-
-      if (canProxy) {
-        helpText += `
-  /maialert set <用户ID> [on|off] - 设置他人的播报状态（需要auth等级${authLevelForProxy}以上）`
-      }
-
       // 隐藏锁定和保护模式功能（如果hideLockAndProtection为true）；公共 API 下亦不展示（相关机台接口不可用）
       if (!hideLockAndProtection && !isPublicApi) {
         helpText += `
@@ -3948,9 +3872,7 @@ export function apply(ctx: Context, config: Config) {
         helpText += `
 
 👑 管理员指令：
-  /mai管理员关闭所有锁定和保护 - 一键关闭所有人的锁定模式和保护模式（需要auth等级${authLevelForProxy}以上）
-  /mai管理员关闭登录播报 - 关闭/开启登录播报功能（需要auth等级${authLevelForProxy}以上）
-  /mai管理员关闭所有播报 - 强制关闭所有人的maialert状态（需要auth等级${authLevelForProxy}以上）`
+  /mai管理员关闭所有锁定和保护 - 一键关闭所有人的锁定模式和保护模式（需要auth等级${authLevelForProxy}以上）`
       }
 
       if (userAuthority >= authLevelForCardAdmin) {
@@ -4354,7 +4276,6 @@ export function apply(ctx: Context, config: Config) {
           return appendRefId(errorMessage, refId)
         }
 
-        // UserID在新API中是加密的字符串
         const maiUid = String(previewResult.UserID)
         const userName = previewResult.UserName
         const rating = previewResult.Rating ? String(previewResult.Rating) : undefined
@@ -4587,83 +4508,61 @@ export function apply(ctx: Context, config: Config) {
                         (grpView.active
                           ? (`状态：群组优先\n` +
                             (grpView.permanent ? `本群授权到期：永久\n` : `本群授权到期：${grpView.expiresAt!.toLocaleString('zh-CN')}\n`))
-                          : '') +
-                        `🚨 /maialert查看账号提醒状态\n`
+                          : '')
 
-        // 尝试获取最新状态并更新数据库（需要新二维码）
-        let qrTextResultForCharge: { qrText: string; error?: string } | null = null
+        // 通过 user/data（扫码）获取最新账号状态
+        let qrTextResultForCharge: { qrText: string; error?: string; chargeResult?: ChargeResult } | null = null
+
+        const persistPreviewBinding = async (preview: UserPreview, qrCode?: string) => {
+          const patch: Record<string, unknown> = {
+            userName: preview.UserName,
+            rating: preview.Rating ? String(preview.Rating) : undefined,
+          }
+          const numericUid = String(preview.UserID)
+          if (isNumericMaiUid(numericUid)) {
+            patch.maiUid = numericUid
+            ;(binding as UserBinding).maiUid = numericUid
+          }
+          if (preview.UserName != null) {
+            patch.boundPlayerName = String(preview.UserName).trim()
+          }
+          if (qrCode) {
+            patch.lastQrCode = qrCode
+            patch.lastQrCodeTime = new Date()
+          }
+          await ctx.database.set('maibot_bindings', { userId }, patch)
+        }
+
+        const applyPreviewToStatus = async (
+          preview: UserPreview,
+          chargeResult: ChargeResult,
+          qrCode?: string,
+        ) => {
+          await persistPreviewBinding(preview, qrCode)
+          statusInfo += formatAccountStatusBlock(preview)
+          return chargeResult
+        }
+
         try {
-          // 废弃旧的uid策略，每次都需要新的二维码
           const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
           qrTextResultForCharge = qrTextResult
           if (qrTextResult.error) {
             statusInfo += `\n⚠️ 无法获取最新状态：${qrTextResult.error}`
           } else {
-            // 同时获取 preview 和 getCharge（并行执行）
             try {
-              const [preview, chargeResult] = await Promise.all([
-                api.getPreview(machineInfo?.clientId ?? '', qrTextResult.qrText),
-                api.getCharge(
-                  machineInfo.regionId,
-                  machineInfo.clientId,
-                  machineInfo.placeId,
-                  qrTextResult.qrText
-                )
-              ])
-              
-              // 更新数据库中的用户名和Rating
-              await ctx.database.set('maibot_bindings', { userId }, {
-                userName: preview.UserName,
-                rating: preview.Rating ? String(preview.Rating) : undefined,
-              })
-              
-              // 格式化版本信息
-              let versionInfo = ''
-              if (preview.RomVersion && preview.DataVersion) {
-                // 机台版本：取前两个数字，如 1.52.00 -> 1.52
-                const romVersionMatch = preview.RomVersion.match(/^(\d+\.\d+)/)
-                const romVersion = romVersionMatch ? romVersionMatch[1] : preview.RomVersion
-                
-                // 数据版本：取前两个数字 + 最后两个数字转换为字母，如 1.50.09 -> 1.50 - I
-                const dataVersionPrefixMatch = preview.DataVersion.match(/^(\d+\.\d+)/)
-                const dataVersionPrefix = dataVersionPrefixMatch ? dataVersionPrefixMatch[1] : preview.DataVersion
-                
-                // 从版本号末尾提取最后两位数字，如 "1.50.01" -> "01", "1.50.09" -> "09"
-                // 匹配最后一个点后的数字（确保只匹配版本号末尾）
-                let dataVersionLetter = '';
-                // 匹配最后一个点后的1-2位数字
-                const dataVersionMatch = preview.DataVersion.match(/\.(\d{1,2})$/);
-                
-                if (dataVersionMatch) {
-                  // 提取数字字符串，如 "09" 或 "9"
-                  const digitsStr = dataVersionMatch[1];
-                  // 转换为数字，如 "09" -> 9, "9" -> 9
-                  const versionNumber = parseInt(digitsStr, 10);
-                  
-                  // 验证转换是否正确
-                  if (!isNaN(versionNumber) && versionNumber >= 1) {
-                    // 01 -> A, 02 -> B, ..., 09 -> I, 10 -> J, ..., 26 -> Z
-                    // 使用模运算确保在 A-Z 范围内循环（27 -> A, 28 -> B, ...）
-                    const letterIndex = ((versionNumber - 1) % 26) + 1;
-                    // 转换为大写字母：A=65, B=66, ..., Z=90
-                    dataVersionLetter = String.fromCharCode(64 + letterIndex).toUpperCase();
-                  }
-                }
-                
-                versionInfo = `机台版本: ${romVersion}\n` +
-                             `数据版本: ${dataVersionPrefix} - ${dataVersionLetter}\n`
-              }
-              
-              statusInfo += `\n📊 账号信息：\n` +
-                           `用户名: ${preview.UserName || '未知'}\n` +
-                           `Rating: ${preview.Rating || '未知'}\n` +
-                           (versionInfo ? versionInfo : '') +
-                           `登录状态: ${preview.IsLogin === true ? '已登录' : '未登录'}\n` +
-                           `封禁状态: ${preview.BanState === 0 ? '正常' : '已封禁'}\n`
-              
-              // 保存 chargeResult 供后续使用
-              qrTextResultForCharge = { ...qrTextResult } as any
-              ;(qrTextResultForCharge as any).chargeResult = chargeResult
+              const preview = await api.getPreview(machineInfo?.clientId ?? '', qrTextResult.qrText)
+              const chargeUserId = isNumericMaiUid(String(preview.UserID))
+                ? String(preview.UserID)
+                : (isNumericMaiUid(binding.maiUid) ? binding.maiUid : undefined)
+              const chargeResult = await api.getCharge(
+                machineInfo.regionId,
+                machineInfo.clientId,
+                machineInfo.placeId,
+                qrTextResult.qrText,
+                chargeUserId ? { userId: chargeUserId } : undefined,
+              )
+              const cr = await applyPreviewToStatus(preview, chargeResult, qrTextResult.qrText)
+              qrTextResultForCharge = { ...qrTextResult, chargeResult: cr }
             } catch (error) {
               logger.warn(`获取用户预览信息失败: ${sanitizeError(error)}`)
               statusInfo += `\n⚠️ 无法获取最新状态，请检查API服务`
@@ -4718,26 +4617,27 @@ export function apply(ctx: Context, config: Config) {
         try {
           if (qrTextResultForCharge && !qrTextResultForCharge.error) {
             // 如果已经在上面获取了 chargeResult，直接使用；否则重新获取
-            let chargeResult: any
-            if ((qrTextResultForCharge as any).chargeResult) {
-              // 已经在上面并行获取了，直接使用
-              chargeResult = (qrTextResultForCharge as any).chargeResult
-            } else {
-              // 如果上面获取失败，这里重新获取
+            let chargeResult: ChargeResult | undefined
+            if (qrTextResultForCharge.chargeResult) {
+              chargeResult = qrTextResultForCharge.chargeResult
+            } else if (qrTextResultForCharge.qrText) {
+              const chargeUserId = isNumericMaiUid(binding.maiUid) ? binding.maiUid : undefined
               chargeResult = await api.getCharge(
                 machineInfo.regionId,
                 machineInfo.clientId,
                 machineInfo.placeId,
-                qrTextResultForCharge.qrText
+                qrTextResultForCharge.qrText,
+                chargeUserId ? { userId: chargeUserId } : undefined,
               )
             }
-            
-            if (chargeResult.ChargeStatus && chargeResult.userChargeList) {
+
+            if (chargeResult?.ChargeStatus) {
+              const ticketList = chargeResult.userChargeList ?? []
               const now = new Date()
               const validTickets: Array<{ chargeId: number; stock: number; validDate: string; purchaseDate: string }> = []
               const expiredTickets: Array<{ chargeId: number; stock: number; validDate: string; purchaseDate: string }> = []
               
-              for (const ticket of chargeResult.userChargeList) {
+              for (const ticket of ticketList) {
                 const validDate = new Date(ticket.validDate)
                 if (validDate > now) {
                   validTickets.push(ticket)
@@ -4783,7 +4683,7 @@ export function apply(ctx: Context, config: Config) {
                 statusInfo += `\n\n🎫 票券情况: 暂无有效票券`
               }
             } else {
-              statusInfo += `\n\n🎫 票券情况: 获取失败（${chargeResult.ChargeStatus === false ? 'API返回失败' : '数据格式错误'}）`
+              statusInfo += `\n\n🎫 票券情况: 获取失败（${chargeResult?.ChargeStatus === false ? 'API返回失败' : '数据格式错误'}）`
             }
           }
         } catch (error: any) {
@@ -5291,7 +5191,7 @@ export function apply(ctx: Context, config: Config) {
           qrTextPrefix: qrTextResult.qrText?.substring(0, 12) + '...',
           multiple,
           targetUserId: binding.userId,
-          maiUid: maskUserId(binding.maiUid),
+          playerLabel: formatBindingPlayerLabel(binding),
         })
 
         // Bot 侧发票队列限流（可选）
@@ -5474,7 +5374,7 @@ export function apply(ctx: Context, config: Config) {
         
         // 确认操作（如果未使用 -bypass）
         if (!options?.bypass) {
-          const baseTip = `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放 ${mile} 点舞里程${proxyTip}`
+          const baseTip = `⚠️ 即将为 ${formatBindingPlayerLabel(binding)} 发放 ${mile} 点舞里程${proxyTip}`
           const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
           if (!confirmFirst) {
             return '操作已取消（第一次确认未通过）'
@@ -5510,7 +5410,7 @@ export function apply(ctx: Context, config: Config) {
           ? `\n当前舞里程：${result.CurrentMile}`
           : ''
 
-        return `✅ 已为 ${maskUserId(binding.maiUid)} 发放 ${mile} 点舞里程${current}`
+        return `✅ 已为 ${formatBindingPlayerLabel(binding)} 发放 ${mile} 点舞里程${current}`
       } catch (error: any) {
         logger.error(`发舞里程失败: ${sanitizeError(error)}`)
         if (maintenanceMode) {
@@ -5542,6 +5442,7 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
+      let bindingUserId: string | undefined
       try {
         // 解析参数：可能是SGID或targetUserId
         let qrCode: string | undefined
@@ -5567,6 +5468,7 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const userId = binding.userId
+        bindingUserId = userId
 
         // 检查是否已绑定水鱼Token
         if (!binding.fishToken) {
@@ -5637,6 +5539,7 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
               await recallBotMessages(session, processingMsgIds)
+              await setQrUploadSuccessFlag(ctx, userId, false)
               return `❌ 上传失败：${result.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`
             }
             result = await api.uploadB50(
@@ -5651,6 +5554,7 @@ export function apply(ctx: Context, config: Config) {
                 return '⚠️ 当前账号已有未完成的水鱼B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
               }
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              await setQrUploadSuccessFlag(ctx, userId, false)
               return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
             }
           } else {
@@ -5659,12 +5563,16 @@ export function apply(ctx: Context, config: Config) {
             }
             if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              await setQrUploadSuccessFlag(ctx, userId, false)
               return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}\n${qrOrLoginFailureHint()}${getErrorHelpInfo()}`
             }
             const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+            await setQrUploadSuccessFlag(ctx, userId, false)
             return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
           }
         }
+
+        await setQrUploadSuccessFlag(ctx, userId, true)
 
         const successMessage = formatB50UploadSuccessMessage(result)
         const refId = await logOperation({
@@ -5689,6 +5597,9 @@ export function apply(ctx: Context, config: Config) {
 
         return ''  // 消息已发送，返回空字符串避免重复发送
       } catch (error: any) {
+        if (bindingUserId) {
+          await setQrUploadSuccessFlag(ctx, bindingUserId, false)
+        }
         ctx.logger('maibot').error('上传B50失败:', error)
         if (maintenanceMode) {
           return maintenanceMessage
@@ -6052,7 +5963,7 @@ export function apply(ctx: Context, config: Config) {
         
         // 确认操作（如果未使用 -bypass）
         if (!options?.bypass) {
-          const confirm = await promptYesLocal(session, `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的所有功能票${proxyTip}，确认继续？`)
+          const confirm = await promptYesLocal(session, `⚠️ 即将清空 ${formatBindingPlayerLabel(binding)} 的所有功能票${proxyTip}，确认继续？`)
           if (!confirm) {
             return '操作已取消'
           }
@@ -6077,7 +5988,7 @@ export function apply(ctx: Context, config: Config) {
 
         // 如果4个状态都是 true，则清票成功
         if (loginStatus && logoutStatus && userAllStatus && userLogStatus) {
-          return `✅ 已清空 ${maskUserId(binding.maiUid)} 的所有功能票`
+          return `✅ 已清空 ${formatBindingPlayerLabel(binding)} 的所有功能票`
         }
 
         // 如果4个状态都是 false，需要重新绑定二维码
@@ -6108,7 +6019,7 @@ export function apply(ctx: Context, config: Config) {
               const retryUserLogStatus = retryResult.UserLogStatus === true
 
               if (retryLoginStatus && retryLogoutStatus && retryUserAllStatus && retryUserLogStatus) {
-                return `✅ 重新绑定成功！已清空 ${maskUserId(rebindResult.newBinding.maiUid)} 的所有功能票`
+                return `✅ 重新绑定成功！已清空 ${formatBindingPlayerLabel(rebindResult.newBinding)} 的所有功能票`
               }
               
               return `⚠️ 重新绑定成功，但清票部分失败\n错误信息： ${JSON.stringify(retryResult)}`
@@ -6254,7 +6165,7 @@ export function apply(ctx: Context, config: Config) {
           const stockLabel = isUnlockLockKind ? (stockFinal === 0 ? '锁定' : '解锁') : `数量: ${stockFinal}`
           const confirm = await promptYesLocal(
             session,
-              `⚠️ 即将为 ${maskUserId(binding.maiUid)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}` +
+              `⚠️ 即将为 ${formatBindingPlayerLabel(binding)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}` +
               (itemKind === 13 ? '' : `\nID: ${itemId}`) +
               `\n${stockLabel}\n确认继续？`
           )
@@ -6429,7 +6340,7 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const resultLabel = isUnlockLockKind ? (stockFinal === 0 ? '锁定' : '解锁') : `数量: ${stockFinal}`
-        return `✅ 已为 ${maskUserId(binding.maiUid)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}` +
+        return `✅ 已为 ${formatBindingPlayerLabel(binding)} 获取收藏品${proxyTip}\n类型: ${selectedType?.label}` +
                (itemKind === 13 ? '' : `\nID: ${itemId}`) +
                `\n${resultLabel}`
       } catch (error: any) {
@@ -6530,7 +6441,7 @@ export function apply(ctx: Context, config: Config) {
         if (!options?.bypass) {
           const confirm = await promptYesLocal(
             session,
-            `⚠️ 即将为 ${maskUserId(binding.maiUid)} 修改版本号${proxyTip}\n机台版本: ${romVer}\n数据版本: ${dataVer}\n确认继续？`
+            `⚠️ 即将为 ${formatBindingPlayerLabel(binding)} 修改版本号${proxyTip}\n机台版本: ${romVer}\n数据版本: ${dataVer}\n确认继续？`
           )
           if (!confirm) {
             return '操作已取消'
@@ -6562,7 +6473,7 @@ export function apply(ctx: Context, config: Config) {
           return '❌ 修改版本号失败：服务器返回未成功，请稍后再试或刷新二维码后再试。'
         }
 
-        return `✅ 已为 ${maskUserId(binding.maiUid)} 修改版本号${proxyTip}\n机台版本: ${romVer}\n数据版本: ${dataVer}`
+        return `✅ 已为 ${formatBindingPlayerLabel(binding)} 修改版本号${proxyTip}\n机台版本: ${romVer}\n数据版本: ${dataVer}`
       } catch (error: any) {
         logger.error(`修改版本号失败: ${sanitizeError(error)}`)
         if (maintenanceMode) {
@@ -6630,7 +6541,7 @@ export function apply(ctx: Context, config: Config) {
         if (!options?.bypass) {
           const confirm = await promptYesLocal(
             session,
-            `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label}\nID: ${itemId}\n确认继续？`
+            `⚠️ 即将清空 ${formatBindingPlayerLabel(binding)} 的收藏品\n类型: ${selectedType?.label}\nID: ${itemId}\n确认继续？`
           )
           if (!confirm) {
             return '操作已取消'
@@ -6654,7 +6565,7 @@ export function apply(ctx: Context, config: Config) {
           return '❌ 清空失败：服务器未返回成功状态，请稍后再试或点击获取二维码刷新账号后再试。'
         }
 
-        return `✅ 已清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label}\nID: ${itemId}`
+        return `✅ 已清空 ${formatBindingPlayerLabel(binding)} 的收藏品\n类型: ${selectedType?.label}\nID: ${itemId}`
       } catch (error: any) {
         logger.error(`清收藏品失败: ${sanitizeError(error)}`)
         if (maintenanceMode) {
@@ -6704,7 +6615,7 @@ export function apply(ctx: Context, config: Config) {
         if (!options?.bypass) {
           const confirm = await promptYesLocal(
             session,
-            `⚠️ 即将为 ${maskUserId(binding.maiUid)} 上传乐曲成绩\n` +
+            `⚠️ 即将为 ${formatBindingPlayerLabel(binding)} 上传乐曲成绩\n` +
             `乐曲ID: ${scoreData.musicId}\n` +
             `难度: ${levelLabel}\n` +
             `成就值: ${scoreData.achievement}\n` +
@@ -6790,7 +6701,7 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        return `✅ 已为 ${maskUserId(binding.maiUid)} 上传乐曲成绩\n` +
+        return `✅ 已为 ${formatBindingPlayerLabel(binding)} 上传乐曲成绩\n` +
                `乐曲ID: ${scoreData.musicId}\n` +
                `难度: ${levelLabel}\n` +
                `成就值: ${scoreData.achievement}\n` +
@@ -6876,7 +6787,7 @@ export function apply(ctx: Context, config: Config) {
         if (!options?.bypass) {
           const confirm = await promptYesLocal(
             session,
-            `⚠️ 即将删除 ${maskUserId(binding.maiUid)} 的乐曲成绩${proxyTip}\n乐曲ID: ${musicId}\n难度: ${levelLabel}\n确认继续？`
+            `⚠️ 即将删除 ${formatBindingPlayerLabel(binding)} 的乐曲成绩${proxyTip}\n乐曲ID: ${musicId}\n难度: ${levelLabel}\n确认继续？`
           )
           if (!confirm) {
             return '操作已取消'
@@ -6898,7 +6809,7 @@ export function apply(ctx: Context, config: Config) {
           return `❌ 删除成绩失败：${result.msg || '服务器返回未成功'}`
         }
 
-        return `✅ 已删除 ${maskUserId(binding.maiUid)} 的乐曲成绩${proxyTip}\n乐曲ID: ${musicId}\n难度: ${levelLabel}`
+        return `✅ 已删除 ${formatBindingPlayerLabel(binding)} 的乐曲成绩${proxyTip}\n乐曲ID: ${musicId}\n难度: ${levelLabel}`
       } catch (error: any) {
         logger.error(`删除乐曲成绩失败: ${sanitizeError(error)}`)
         if (maintenanceMode) {
@@ -7187,616 +7098,6 @@ export function apply(ctx: Context, config: Config) {
     })
 
   }
-
-  // 提醒功能配置
-  const alertMessages = config.alertMessages || {
-    loginMessage: '{playerid}{at} 你的账号已上线。',
-    logoutMessage: '{playerid}{at} 你的账号已下线。',
-  }
-  const checkInterval = config.alertCheckInterval ?? 60000  // 默认60秒
-  const concurrency = config.alertConcurrency ?? 3  // 默认并发3个
-  const lockRefreshDelay = config.lockRefreshDelay ?? 1000  // 默认1秒延迟
-  const lockRefreshConcurrency = config.lockRefreshConcurrency ?? 3  // 默认并发3个
-
-  /**
-   * 检查单个用户的登录状态
-   */
-  const checkUserStatus = async (binding: UserBinding) => {
-    // 检查插件是否还在运行
-    if (!isPluginActive) {
-      // logger.debug('插件已停止，跳过检查用户状态')  // 隐藏日志
-      return
-    }
-
-    try {
-      // 在执行 preview 前，再次检查账号是否仍然启用播报且未被锁定（可能在并发执行过程中被修改了）
-      const currentBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
-      if (currentBinding.length === 0) {
-        // logger.debug(`用户 ${binding.userId} 绑定记录已删除，跳过检查`)  // 隐藏日志
-        return
-      }
-      
-      const current = currentBinding[0]
-      if (!current.alertEnabled || current.isLocked) {
-        // logger.debug(`用户 ${binding.userId} 播报已关闭或账号已锁定，跳过检查 (alertEnabled: ${current.alertEnabled}, isLocked: ${current.isLocked})`)  // 隐藏日志
-        return
-      }
-
-      // 再次检查插件状态
-      if (!isPluginActive) {
-        // logger.debug('插件已停止，取消预览请求')  // 隐藏日志
-        return
-      }
-
-      // 再次检查插件状态
-      if (!isPluginActive) {
-        // logger.debug('插件已停止，取消预览请求')  // 隐藏日志
-        return
-      }
-
-      // logger.debug(`检查用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的状态`)  // 隐藏日志
-      
-      // 从数据库读取上一次保存的状态（用于比较）
-      const lastSavedStatus = current.lastLoginStatus
-      // logger.debug(`用户 ${binding.userId} 数据库中保存的上一次状态: ${lastSavedStatus} (类型: ${typeof lastSavedStatus})`)  // 隐藏日志
-      
-      // 获取当前登录状态
-      // 废弃旧的uid策略，后台任务无法交互式获取二维码，跳过检查
-      // 注意：由于废弃了uid策略，后台状态检查功能已禁用
-      // logger.warn(`用户 ${binding.userId} 状态检查：由于废弃uid策略，后台任务无法获取新二维码，跳过检查`)  // 隐藏日志
-      return
-    } catch (error) {
-      logger.error(`检查用户 ${binding.userId} 状态失败: ${sanitizeError(error)}`)
-    }
-  }
-
-  /**
-   * 并发处理函数：将数组分批并发处理
-   */
-  const processBatch = async <T>(items: T[], concurrency: number, processor: (item: T) => Promise<void>) => {
-    for (let i = 0; i < items.length; i += concurrency) {
-      const batch = items.slice(i, i + concurrency)
-      await Promise.all(batch.map(processor))
-    }
-  }
-
-  /**
-   * 账号状态提醒功能
-   * 使用配置的间隔和并发数检查所有启用播报的用户状态
-   */
-  const checkLoginStatus = async () => {
-    // 检查插件是否还在运行
-    if (!isPluginActive) {
-      // logger.debug('插件已停止，取消检查登录状态任务')  // 隐藏日志
-      return
-    }
-
-    // 检查登录播报功能是否被管理员关闭
-    if (!alertFeatureEnabled) {
-      // logger.debug('登录播报功能已被管理员关闭，跳过检查')  // 隐藏日志
-      return
-    }
-
-    // logger.debug('开始检查登录状态...')  // 隐藏日志，减少刷屏
-    try {
-      // 获取所有绑定记录
-      const allBindings = await ctx.database.get('maibot_bindings', {})
-      // logger.debug(`总共有 ${allBindings.length} 个绑定记录`)  // 隐藏日志
-      
-      // 过滤出启用播报的用户（alertEnabled 为 true），但排除已锁定的账号
-      const bindings = allBindings.filter(b => {
-        const enabled = b.alertEnabled === true
-        const isLocked = b.isLocked === true
-        // 隐藏详细的用户状态日志
-        // if (enabled && !isLocked) {
-        //   logger.debug(`用户 ${b.userId} 启用了播报 (alertEnabled: ${b.alertEnabled}, guildId: ${b.guildId}, channelId: ${b.channelId})`)
-        // } else if (enabled && isLocked) {
-        //   logger.debug(`用户 ${b.userId} 启用了播报但账号已锁定，跳过推送`)
-        // }
-        return enabled && !isLocked
-      })
-      // logger.info(`启用播报的用户数量: ${bindings.length}`)  // 隐藏日志
-      
-      // if (bindings.length > 0) {
-      //   logger.debug(`启用播报的用户列表: ${bindings.map(b => `${b.userId}(${maskUserId(b.maiUid)})`).join(', ')}`)
-      // }
-      
-      if (bindings.length === 0) {
-        // logger.debug('没有启用播报的用户，跳过检查')  // 隐藏日志
-        return
-      }
-
-      // 使用并发处理
-      // logger.debug(`使用并发数 ${concurrency} 检查 ${bindings.length} 个用户`)  // 隐藏日志
-      await processBatch(bindings, concurrency, checkUserStatus)
-      
-    } catch (error) {
-      logger.error(`检查登录状态失败: ${sanitizeError(error)}`)
-    }
-    // logger.debug('登录状态检查完成')  // 隐藏日志，减少刷屏
-  }
-
-  // 启动定时任务，使用配置的间隔
-  logger.info(`账号状态提醒功能已启动，检查间隔: ${checkInterval}ms (${checkInterval / 1000}秒)，并发数: ${concurrency}`)
-  ctx.setInterval(checkLoginStatus, checkInterval)
-  
-  // 立即执行一次检查（用于调试和初始化）
-  ctx.setTimeout(() => {
-    logger.info('执行首次登录状态检查...')
-    checkLoginStatus()
-  }, 5000) // 5秒后执行首次检查
-
-  /**
-   * 刷新单个锁定账号的登录状态
-   * @deprecated 锁定功能已在新API中移除，已注释
-   */
-  /*
-  const refreshSingleLockedAccount = async (binding: UserBinding) => {
-    // 检查插件是否还在运行
-    if (!isPluginActive) {
-      logger.debug('插件已停止，跳过刷新登录状态')
-      return
-    }
-
-    try {
-      // 在执行 login 前，再次检查账号是否仍然被锁定（可能在并发执行过程中被解锁了）
-      const currentBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
-      if (currentBinding.length === 0 || !currentBinding[0].isLocked) {
-        logger.debug(`用户 ${binding.userId} 账号已解锁，跳过刷新登录状态`)
-        return
-      }
-
-      // 再次检查插件状态
-      if (!isPluginActive) {
-        logger.debug('插件已停止，取消登录请求')
-        return
-      }
-
-      logger.debug(`刷新用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的登录状态`)
-      
-      // 重新执行登录
-      const result = await api.login(
-        binding.maiUid,
-        machineInfo.regionId,
-        machineInfo.placeId,
-        machineInfo.clientId,
-        turnstileToken,
-      )
-      
-      if (result.LoginStatus) {
-        // 更新LoginId（如果有变化）
-        if (result.LoginId && result.LoginId !== binding.lockLoginId) {
-          await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
-            lockLoginId: result.LoginId,
-          })
-          logger.info(`用户 ${binding.userId} 登录状态已刷新，LoginId: ${result.LoginId}`)
-        } else {
-          logger.debug(`用户 ${binding.userId} 登录状态已刷新`)
-        }
-      } else {
-        if (result.UserID === -2) {
-          logger.error(`用户 ${binding.userId} 刷新登录失败：Turnstile校验失败`)
-        } else {
-          logger.error(`用户 ${binding.userId} 刷新登录失败：服务端未返回成功状态`)
-        }
-      }
-    } catch (error) {
-      logger.error(`刷新用户 ${binding.userId} 登录状态失败: ${sanitizeError(error)}`)
-    }
-  }
-
-  /**
-   * 保持锁定账号的登录状态
-   * 使用并发处理和延迟对锁定的用户重新执行login
-   * @deprecated 锁定功能已在新API中移除，已注释
-   */
-  /*
-  const refreshLockedAccounts = async () => {
-    // 检查插件是否还在运行
-    if (!isPluginActive) {
-      logger.debug('插件已停止，取消刷新锁定账号任务')
-      return
-    }
-
-    logger.debug('开始刷新锁定账号的登录状态...')
-    try {
-      // 获取所有锁定的账号
-      const lockedBindings = await ctx.database.get('maibot_bindings', {
-        isLocked: true,
-      })
-      
-      logger.info(`找到 ${lockedBindings.length} 个锁定的账号，开始刷新登录状态（并发数: ${lockRefreshConcurrency}，延迟: ${lockRefreshDelay}ms）`)
-      
-      if (lockedBindings.length === 0) {
-        logger.debug('没有锁定的账号需要刷新')
-        return
-      }
-
-      // 使用并发处理，批次之间添加延迟
-      // refreshSingleLockedAccount 内部会检查账号是否仍然被锁定，所以这里直接处理即可
-      for (let i = 0; i < lockedBindings.length; i += lockRefreshConcurrency) {
-        // 在每批处理前检查插件状态
-        if (!isPluginActive) {
-          logger.debug('插件已停止，中断刷新锁定账号任务')
-          break
-        }
-
-        const batch = lockedBindings.slice(i, i + lockRefreshConcurrency)
-        // 并发处理当前批次（每个任务内部会检查账号是否仍然被锁定）
-        await Promise.all(batch.map(refreshSingleLockedAccount))
-        
-        // 如果不是最后一批，添加延迟（延迟前再次检查插件状态）
-        if (i + lockRefreshConcurrency < lockedBindings.length) {
-          if (!isPluginActive) {
-            logger.debug('插件已停止，中断刷新锁定账号任务')
-            break
-          }
-          await new Promise(resolve => setTimeout(resolve, lockRefreshDelay))
-        }
-      }
-    } catch (error) {
-      logger.error(`刷新锁定账号登录状态失败: ${sanitizeError(error)}`)
-    }
-    // logger.debug('锁定账号登录状态刷新完成')  // 隐藏日志
-  }
-
-  // 启动锁定账号刷新任务，每1分钟执行一次
-  const lockRefreshInterval = 60 * 1000  // 1分钟
-  logger.info(`锁定账号刷新功能已启动，每1分钟刷新一次`)
-  ctx.setInterval(refreshLockedAccounts, lockRefreshInterval)
-  
-  // 立即执行一次刷新（延迟30秒，避免与首次检查冲突）
-  ctx.setTimeout(() => {
-    logger.info('执行首次锁定账号刷新...')
-    refreshLockedAccounts()
-  }, 30000) // 30秒后执行首次刷新
-  */
-
-  /**
-   * 保护模式：自动锁定单个账号（当检测到下线时）
-   * @deprecated 保护模式功能已在新API中移除，已注释
-   */
-  /*
-  const autoLockAccount = async (binding: UserBinding) => {
-    // 检查插件是否还在运行
-    if (!isPluginActive) {
-      logger.debug('插件已停止，跳过自动锁定检查')
-      return
-    }
-
-    try {
-      // 再次检查账号是否仍在保护模式下且未锁定
-      const currentBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
-      if (currentBinding.length === 0 || !currentBinding[0].protectionMode || currentBinding[0].isLocked) {
-        logger.debug(`用户 ${binding.userId} 保护模式已关闭或账号已锁定，跳过自动锁定检查`)
-        return
-      }
-
-      // 再次检查插件状态
-      if (!isPluginActive) {
-        logger.debug('插件已停止，取消预览请求')
-        return
-      }
-
-      logger.debug(`保护模式：检查用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的登录状态`)
-      
-      // 获取当前登录状态
-      // 废弃旧的uid策略，后台任务无法交互式获取二维码，跳过检查
-      // 注意：由于废弃了uid策略，后台保护模式检查功能已禁用
-      logger.warn(`用户 ${binding.userId} 保护模式检查：由于废弃uid策略，后台任务无法获取新二维码，跳过检查`)
-      return
-    } catch (error) {
-      logger.error(`保护模式检查用户 ${binding.userId} 状态失败: ${sanitizeError(error)}`)
-    }
-  }
-
-  /**
-   * 锁定账号刷新功能（后台任务）
-   */
-  const refreshLockedAccounts = async () => {
-    // 查找所有已锁定的账号
-    // ... (删除所有后续代码，因为保护模式功能已禁用)
-    return
-  }
-
-  // 启动定时任务（已禁用，因为废弃了uid策略）
-  // ctx.setInterval(refreshLockedAccounts, lockRefreshInterval)
-  
-  // 禁用保护模式定时检查（已禁用，因为废弃了uid策略）
-  // ctx.setInterval(checkProtectionMode, protectionCheckInterval)
-
-  // 以下代码已删除，因为废弃了uid策略导致后台任务无法获取新二维码
-  /*
-      // 如果账号已下线，尝试自动锁定
-      if (!currentLoginStatus) {
-        logger.info(`保护模式：检测到用户 ${binding.userId} 账号已下线，尝试自动锁定`)
-        
-        // 再次确认账号状态和插件状态
-        const verifyBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
-        if (verifyBinding.length === 0 || !verifyBinding[0].protectionMode || verifyBinding[0].isLocked) {
-          logger.debug(`用户 ${binding.userId} 保护模式已关闭或账号已锁定，取消自动锁定`)
-          return
-        }
-
-        if (!isPluginActive) {
-          logger.debug('插件已停止，取消自动锁定请求')
-          return
-        }
-
-        // 执行锁定
-        const result = await api.login(
-          binding.maiUid,
-          machineInfo.regionId,
-          machineInfo.placeId,
-          machineInfo.clientId,
-          turnstileToken,
-        )
-
-        if (result.LoginStatus) {
-          // 锁定成功，更新数据库
-          await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
-            isLocked: true,
-            lockTime: new Date(),
-            lockLoginId: result.LoginId,
-          })
-          logger.info(`保护模式：用户 ${binding.userId} 账号已自动锁定成功，LoginId: ${result.LoginId}`)
-          
-          // 发送@用户通知
-          const finalBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
-          if (finalBinding.length > 0 && finalBinding[0].guildId && finalBinding[0].channelId) {
-            try {
-              // 获取玩家名
-              // 获取玩家名
-              const playerName = preview.UserName || binding.userName || '玩家'
-              const message = renderNotifyTemplate(protectionLockMessage, {
-                playerName,
-                atUserId: binding.userId,
-              })
-              
-              // 尝试使用第一个可用的bot发送消息
-              let sent = false
-              for (const bot of ctx.bots) {
-                try {
-                  await bot.sendMessage(finalBinding[0].channelId, message, finalBinding[0].guildId)
-                  logger.info(`✅ 已发送保护模式锁定成功通知给用户 ${binding.userId} (${playerName})`)
-                  sent = true
-                  break // 成功发送后退出循环
-                } catch (error) {
-                  logger.warn(`bot ${bot.selfId} 发送保护模式通知失败:`, error)
-                  continue
-                }
-              }
-              
-              if (!sent) {
-                logger.error(`❌ 所有bot都无法发送保护模式通知给用户 ${binding.userId}`)
-              }
-            } catch (error) {
-              logger.error(`发送保护模式通知失败:`, error)
-            }
-          }
-        } else {
-          logger.warn(`保护模式：用户 ${binding.userId} 自动锁定失败，将在下次检查时重试`)
-          if (result.UserID === -2) {
-            logger.error(`保护模式：用户 ${binding.userId} 自动锁定失败：Turnstile校验失败`)
-          }
-        }
-      } else {
-        logger.debug(`保护模式：用户 ${binding.userId} 账号仍在线上，无需锁定`)
-      }
-    } catch (error) {
-      logger.error(`保护模式：检查用户 ${binding.userId} 状态失败: ${sanitizeError(error)}`)
-    }
-  }
-
-  /**
-   * 保护模式：检查所有启用保护模式的账号，自动锁定已下线的账号
-   * @deprecated 保护模式功能已在新API中移除，已注释
-   */
-  /*
-  const checkProtectionMode = async () => {
-    // 检查插件是否还在运行
-    if (!isPluginActive) {
-      logger.debug('插件已停止，取消保护模式检查任务')
-      return
-    }
-
-    logger.debug('开始检查保护模式账号...')
-    try {
-      // 获取所有启用保护模式且未锁定的账号
-      const allBindings = await ctx.database.get('maibot_bindings', {})
-      logger.debug(`总共有 ${allBindings.length} 个绑定记录`)
-
-      // 过滤出启用保护模式且未锁定的账号
-      const bindings = allBindings.filter(b => {
-        return b.protectionMode === true && b.isLocked !== true
-      })
-      
-      logger.debug(`启用保护模式的账号数量: ${bindings.length}`)
-      
-      if (bindings.length > 0) {
-        logger.debug(`启用保护模式的账号列表: ${bindings.map(b => `${b.userId}(${maskUserId(b.maiUid)})`).join(', ')}`)
-      }
-      
-      if (bindings.length === 0) {
-        logger.debug('没有启用保护模式的账号，跳过检查')
-        return
-      }
-
-      // 使用并发处理
-      logger.debug(`使用并发数 ${concurrency} 检查 ${bindings.length} 个保护模式账号`)
-      await processBatch(bindings, concurrency, autoLockAccount)
-      
-    } catch (error) {
-      logger.error(`检查保护模式账号失败: ${sanitizeError(error)}`)
-    }
-    // logger.debug('保护模式检查完成')  // 隐藏日志
-  }
-
-  // 启动保护模式检查定时任务，使用配置的间隔
-  const protectionCheckInterval = config.protectionCheckInterval ?? 60000  // 默认60秒
-  logger.info(`账号保护模式检查功能已启动，检查间隔: ${protectionCheckInterval}ms (${protectionCheckInterval / 1000}秒)，并发数: ${concurrency}`)
-  ctx.setInterval(checkProtectionMode, protectionCheckInterval)
-  
-  // 立即执行一次检查（延迟35秒，避免与其他检查冲突）
-  ctx.setTimeout(() => {
-    logger.info('执行首次保护模式检查...')
-    checkProtectionMode()
-  }, 35000) // 35秒后执行首次检查
-
-  /**
-   * 开关播报功能
-   * 用法: /maialert [on|off]
-   */
-  ctx.command('maialert [state:text]', '开关账号状态播报功能')
-    .action(async ({ session }, state) => {
-      if (!session) {
-        return '❌ 无法获取会话信息'
-      }
-
-      const userId = String(session.userId)
-
-      try {
-        // 检查是否已绑定账号
-        const binding = await getBindingBySession(ctx, session)
-        if (!binding) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
-        }
-        const currentState = binding.alertEnabled ?? false
-
-        // 如果没有提供参数，显示当前状态
-        if (!state) {
-          return `当前播报状态: ${currentState ? '✅ 已开启' : '❌ 已关闭'}\n\n使用 /maialert on 开启\n使用 /maialert off 关闭`
-        }
-
-        const newState = state.toLowerCase() === 'on' || state.toLowerCase() === 'true' || state === '1'
-
-        // 如果状态没有变化
-        if (currentState === newState) {
-          return `播报状态已经是 ${newState ? '开启' : '关闭'} 状态`
-        }
-
-        // 更新状态，同时保存群组和频道信息
-        const guildId = session.guildId || binding.guildId
-        const channelId = session.channelId || binding.channelId
-        
-        logger.info(`用户 ${userId} ${newState ? '开启' : '关闭'}播报功能，guildId: ${guildId}, channelId: ${channelId}`)
-        
-        const updateData: any = {
-          alertEnabled: newState,
-        }
-        
-        if (guildId) {
-          updateData.guildId = guildId
-        }
-        if (channelId) {
-          updateData.channelId = channelId
-        }
-        
-        await updateBindingBySession(ctx, session, updateData)
-
-        // 如果是首次开启，初始化登录状态
-        // 废弃旧的uid策略，无法使用缓存的qrCode或maiUid初始化状态
-        if (newState && binding.lastLoginStatus === undefined) {
-          logger.warn(`用户 ${userId} 状态初始化：由于废弃uid策略，无法使用缓存的qrCode或maiUid初始化状态，跳过初始化`)
-          // 设置为undefined，等待用户下次使用指令时通过新二维码获取状态
-        }
-
-        let resultMessage = `✅ 播报功能已${newState ? '开启' : '关闭'}`
-        if (newState) {
-          if (!guildId || !channelId) {
-            resultMessage += `\n⚠️ 警告：当前会话缺少群组信息，提醒可能无法发送。请在群内使用此命令。`
-          } else {
-            resultMessage += `\n当账号登录状态发生变化时，会在群内提醒你。`
-          }
-        } else {
-          resultMessage += `\n已停止播报账号状态变化。`
-        }
-        
-        return resultMessage
-      } catch (error: any) {
-        logger.error('开关播报功能失败:', error)
-        if (maintenanceMode) {
-          return maintenanceMessage
-        }
-        return `❌ 操作失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
-      }
-    })
-
-  /**
-   * 管理员开关他人的播报状态
-   * 用法: /maialert set <userId> [on|off]
-   */
-  ctx.command('maialert set <targetUserId:text> [state:text]', '设置他人的播报状态（需要auth等级3以上）')
-    .userFields(['authority'])
-    .action(async ({ session }, targetUserId, state) => {
-      if (!session) {
-        return '❌ 无法获取会话信息'
-      }
-
-      // 检查权限
-      if ((session.user?.authority ?? 0) < 3) {
-        return '❌ 权限不足，需要auth等级3以上才能设置他人的播报状态'
-      }
-
-      if (!targetUserId) {
-        return '请提供目标用户ID\n用法：/maialert set <userId> [on|off]'
-      }
-
-      if (!state) {
-        return '请提供状态\n用法：/maialert set <userId> on 或 /maialert set <userId> off'
-      }
-
-      try {
-        // 检查目标用户是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId: targetUserId })
-        
-        if (bindings.length === 0) {
-          return `❌ 用户 ${targetUserId} 尚未绑定账号`
-        }
-
-        const binding = bindings[0]
-        const newState = state.toLowerCase() === 'on' || state.toLowerCase() === 'true' || state === '1'
-        
-        const guildId = session.guildId || binding.guildId
-        const channelId = session.channelId || binding.channelId
-        
-        logger.info(`管理员 ${session.userId} ${newState ? '开启' : '关闭'}用户 ${targetUserId} 的播报功能，guildId: ${guildId}, channelId: ${channelId}`)
-
-        // 更新状态
-        const updateData: any = {
-          alertEnabled: newState,
-        }
-        
-        if (guildId) {
-          updateData.guildId = guildId
-        }
-        if (channelId) {
-          updateData.channelId = channelId
-        }
-        
-        await ctx.database.set('maibot_bindings', { userId: targetUserId }, updateData)
-
-        // 如果是首次开启，初始化登录状态
-        // 废弃旧的uid策略，无法使用缓存的qrCode初始化状态
-        if (newState && binding.lastLoginStatus === undefined) {
-          logger.warn(`用户 ${targetUserId} 状态初始化：由于废弃uid策略，无法使用缓存的qrCode初始化状态，跳过初始化`)
-          // 设置为undefined，等待用户下次使用指令时通过新二维码获取状态
-        }
-
-        let resultMessage = `✅ 已${newState ? '开启' : '关闭'}用户 ${targetUserId} 的播报功能`
-        if (newState && (!guildId || !channelId)) {
-          resultMessage += `\n⚠️ 警告：当前会话缺少群组信息，提醒可能无法发送。`
-        }
-        
-        return resultMessage
-      } catch (error: any) {
-        logger.error('设置他人播报状态失败:', error)
-        if (maintenanceMode) {
-          return maintenanceMessage
-        }
-        return `❌ 操作失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
-      }
-    })
 
   /**
    * 开关账号保护模式
@@ -8182,106 +7483,6 @@ export function apply(ctx: Context, config: Config) {
         logger.error('查询统计失败:', error)
         return `❌ 查询失败: ${getSafeErrorMessage(error, session)}`
       }
-    })
-
-  /**
-   * 管理员关闭/开启登录播报功能（全局开关）
-   * 用法: /mai管理员关闭登录播报 [on|off]
-   */
-  ctx.command('mai管理员关闭登录播报 [state:text]', '关闭/开启登录播报功能（需要auth等级3以上）')
-    .userFields(['authority'])
-    .option('bypass', '-bypass  绕过确认')
-    .action(async ({ session, options }, state) => {
-      if (!session) return '❌ 无法获取会话信息'
-      if ((session.user?.authority ?? 0) < 3) {
-        return '❌ 权限不足，需要auth等级3以上才能执行此操作'
-      }
-
-      const current = alertFeatureEnabled
-      if (!state) {
-        return `当前登录播报全局状态: ${current ? '✅ 开启' : '❌ 关闭'}\n\n用法：/mai管理员关闭登录播报 on（开启）\n用法：/mai管理员关闭登录播报 off（关闭）`
-      }
-
-      const s = state.trim().toLowerCase()
-      const next = (s === 'on' || s === 'true' || s === '1') ? true
-        : (s === 'off' || s === 'false' || s === '0') ? false
-        : null
-
-      if (next === null) {
-        return '参数错误：只能是 on/off\n用法：/mai管理员关闭登录播报 on 或 /mai管理员关闭登录播报 off'
-      }
-
-      if (next === current) {
-        return `登录播报全局状态已经是 ${next ? '开启' : '关闭'}`
-      }
-
-      // 关闭时：默认强制关闭所有人的 maialert 状态，避免仍在开启但不会推送造成困惑
-      if (!next) {
-        if (!options?.bypass) {
-          const confirm = await promptYesLocal(
-            session,
-            '⚠️ 即将关闭【登录播报全局功能】并强制关闭所有人的 maialert 状态\n确认继续？'
-          )
-          if (!confirm) return '操作已取消'
-        }
-
-        await session.send('⏳ 正在关闭登录播报并强制关闭所有播报，请稍候...')
-
-        const allBindings = await ctx.database.get('maibot_bindings', {})
-        let updated = 0
-        for (const b of allBindings) {
-          if (b.alertEnabled === true) {
-            await ctx.database.set('maibot_bindings', { userId: b.userId }, { alertEnabled: false })
-            updated++
-          }
-        }
-
-        await saveAlertFeatureEnabled(false)
-        logger.info(`管理员 ${session.userId} 关闭登录播报全局功能，并强制关闭了 ${updated} 个用户的 maialert`)
-        return `✅ 登录播报全局功能已关闭\n已强制关闭 maialert 的用户数: ${updated}`
-      }
-
-      // 开启时：只恢复全局开关，不自动开启任何人的 maialert
-      await saveAlertFeatureEnabled(true)
-      logger.info(`管理员 ${session.userId} 开启登录播报全局功能`)
-      return '✅ 登录播报全局功能已开启（不会自动开启任何人的 maialert）'
-    })
-
-  /**
-   * 管理员强制关闭所有人的 maialert 状态
-   * 用法: /mai管理员关闭所有播报
-   */
-  ctx.command('mai管理员关闭所有播报', '强制关闭所有人的maialert状态（需要auth等级3以上）')
-    .userFields(['authority'])
-    .option('bypass', '-bypass  绕过确认')
-    .action(async ({ session, options }) => {
-      if (!session) return '❌ 无法获取会话信息'
-      if ((session.user?.authority ?? 0) < 3) {
-        return '❌ 权限不足，需要auth等级3以上才能执行此操作'
-      }
-
-      if (!options?.bypass) {
-        const confirm = await promptYesLocal(
-          session,
-          '⚠️ 即将强制关闭所有人的 maialert 状态（仅影响播报开关，不影响绑定/锁定/保护模式）\n确认继续？'
-        )
-        if (!confirm) return '操作已取消'
-      }
-
-      await session.send('⏳ 正在强制关闭所有播报，请稍候...')
-      const allBindings = await ctx.database.get('maibot_bindings', {})
-      let updated = 0
-      for (const b of allBindings) {
-        if (b.alertEnabled === true) {
-          await ctx.database.set('maibot_bindings', { userId: b.userId }, { alertEnabled: false })
-          updated++
-        }
-      }
-
-      logger.info(`管理员 ${session.userId} 强制关闭所有播报，关闭了 ${updated} 个用户的 maialert`)
-      return updated === 0
-        ? 'ℹ️ 没有需要关闭的用户（所有人的 maialert 都已是关闭状态）'
-        : `✅ 已强制关闭所有人的 maialert\n关闭的用户数: ${updated}`
     })
 
   ctx.command('mai兑换卡密 [code:text]', '兑换卡密（个人/群组/解绑卡；解绑卡需已绑定舞萌）')
