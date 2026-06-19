@@ -1,9 +1,21 @@
-import { Context, Schema, Session } from 'koishi'
-import { MaiBotAPI, isSyncB50Upload } from './api'
+import { Context, h, Schema, Session, type Fragment } from 'koishi'
+import {
+  MaiBotAPI,
+  findMatchingChargeTask,
+  formatChargeTaskStatus,
+  isSyncB50Upload,
+} from './api'
 import {
   formatBindChangeWaitHuman,
   isDxBound,
+  isValidLxnsToken,
+  lxnsTokenFormatError,
+  maskLxnsToken,
   msUntilBindChangeAllowed,
+  purgeAllLxnsBindings,
+  purgeInvalidLxnsBindings,
+  clearUserLxnsBinding,
+  LXNS_TOKEN_HINT_URL,
   verifyPreviewMatchesBinding,
   type VerifyPreviewBindingResult,
 } from './binding-verify'
@@ -148,6 +160,10 @@ export interface Config {
     enabled?: boolean
     version?: string
   }
+  /** 群聊内回复时引用原消息并 @ 发送者 */
+  replyInGroup?: boolean
+  chargePollInterval?: number
+  chargePollTimeout?: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -316,6 +332,9 @@ export const Config: Schema<Config> = Schema.object({
     enabled: true,
     version: '2.0.0',
   }),
+  replyInGroup: Schema.boolean().default(true).description('群聊内 Bot 回复时引用用户消息并 @ 发送者'),
+  chargePollInterval: Schema.number().default(3000).description('发票充值队列轮询间隔（毫秒），默认 3 秒'),
+  chargePollTimeout: Schema.number().default(180000).description('发票充值队列轮询超时（毫秒），默认 3 分钟'),
 }).description(
   '【公共 API】申请 https://api.awmc.team',
 )
@@ -398,6 +417,31 @@ function sanitizeError(error: any): string {
 
 /** Session 上暂存当前正在执行的指令用法（由 command/before-execute 写入） */
 const MAI_SESSION_CMD_USAGE_KEY = '__maiCmdUsageHint'
+const MAI_GUILD_REPLY_KEY = '__maiGuildReplyEnabled'
+
+function shouldUseGroupReply(session: Session, replyInGroup: boolean): boolean {
+  return replyInGroup && !!session.guildId && !!session.userId
+}
+
+function wrapForGroupReply(session: Session, content: unknown): Fragment {
+  if (content == null) return ''
+  if (typeof content !== 'string') return content as Fragment
+  if (content.includes('<at id=')) return content
+  const text = `${buildMention(session)}\n${content}`
+  if (session.messageId) {
+    return [h.quote(session.messageId), text]
+  }
+  return text
+}
+
+function enableGuildReplyOnSession(session: Session, replyInGroup: boolean): void {
+  if (!shouldUseGroupReply(session, replyInGroup)) return
+  ;(session as unknown as Record<string, unknown>)[MAI_GUILD_REPLY_KEY] = true
+}
+
+function disableGuildReplyOnSession(session: Session): void {
+  delete (session as unknown as Record<string, unknown>)[MAI_GUILD_REPLY_KEY]
+}
 
 function getSessionCommandUsageHint(session?: Session): string {
   if (!session) return ''
@@ -1886,12 +1930,16 @@ export function apply(ctx: Context, config: Config) {
   // Koishi 等框架在指令未捕获异常时可能只回复「发生未知错误」，此处附上当前指令用法
   ctx.on('before-send', (session: Session) => {
     const c = session.content
-    if (typeof c !== 'string') return
-    const t = c.trim()
-    if (t.length > 200) return
-    if (/^(发生未知错误\.?|未知错误\.?|An unknown error\.?)$/i.test(t)) {
-      const extra = formatCommandUsageAppend(session)
-      if (extra) session.content = `${c}${extra}`
+    if (typeof c === 'string') {
+      const bag = session as unknown as Record<string, unknown>
+      if (bag[MAI_GUILD_REPLY_KEY] && !c.includes('<at id=')) {
+        session.content = wrapForGroupReply(session, c) as typeof session.content
+      }
+      const t = c.trim()
+      if (t.length <= 200 && /^(发生未知错误\.?|未知错误\.?|An unknown error\.?)$/i.test(t)) {
+        const extra = formatCommandUsageAppend(session)
+        if (extra) session.content = `${c}${extra}`
+      }
     }
   })
 
@@ -1908,6 +1956,19 @@ export function apply(ctx: Context, config: Config) {
   logger.info(
     `API 模式: ${isPublicApi ? 'public（AWMC 网关）' : 'team（自建服务）'}，根地址: ${config.apiBaseURL}`,
   )
+
+  ctx.on('ready', async () => {
+    try {
+      const cleared = await purgeInvalidLxnsBindings(ctx)
+      if (cleared > 0) {
+        logger.info(
+          `已自动清除 ${cleared} 条旧版落雪好友码绑定，请用户使用 Token 重新 /mai绑定落雪（${LXNS_TOKEN_HINT_URL}）`,
+        )
+      }
+    } catch (e) {
+      logger.warn('启动时清除旧版落雪绑定失败', e)
+    }
+  })
 
   function rebindShopUrl(): string {
     const fromPolicy = config.rebindPolicy?.shopUrl?.trim()
@@ -1963,6 +2024,9 @@ export function apply(ctx: Context, config: Config) {
 
   // 操作记录配置
   const operationLogConfig = config.operationLog || { enabled: true, refIdLabel: 'Ref_ID' }
+  const replyInGroupEnabled = config.replyInGroup !== false
+  const chargePollIntervalMs = config.chargePollInterval ?? 3000
+  const chargePollTimeoutMs = config.chargePollTimeout ?? 180000
 
   // 错误帮助URL配置
   const errorHelpUrl = config.errorHelpUrl || ''
@@ -2199,7 +2263,10 @@ export function apply(ctx: Context, config: Config) {
    */
   async function sendAndGetMessageIds(session: Session, content: string): Promise<string[]> {
     try {
-      const result = await session.send(content)
+      const payload = (session as unknown as Record<string, unknown>)[MAI_GUILD_REPLY_KEY]
+        ? wrapForGroupReply(session, content)
+        : content
+      const result = await session.send(payload as string)
       // session.send 返回消息ID数组
       if (Array.isArray(result)) {
         return result.filter(id => id && typeof id === 'string')
@@ -2892,6 +2959,22 @@ export function apply(ctx: Context, config: Config) {
     return '❌ 未输入正确的提示词，操作已取消'
   }, true)
 
+  /** 群聊：mai 指令文本回复引用原消息并 @ 发送者 */
+  ctx.middleware(async (session, next) => {
+    const content = session.content?.trim() || ''
+    if (!content.match(/^\/?mai/i)) return next()
+    enableGuildReplyOnSession(session, replyInGroupEnabled)
+    try {
+      const result = await next()
+      if (typeof result === 'string' && shouldUseGroupReply(session, replyInGroupEnabled)) {
+        return wrapForGroupReply(session, result)
+      }
+      return result
+    } finally {
+      disableGuildReplyOnSession(session)
+    }
+  }, true)
+
   /**
    * 从文本中提取用户ID（支持@userid格式、<at id="数字"/>格式或直接userid）
    */
@@ -3430,6 +3513,107 @@ export function apply(ctx: Context, config: Config) {
     ctx.setTimeout(poll, initialDelay)
   }
 
+  async function sendBotNotification(session: Session, content: string, refId?: string): Promise<void> {
+    const bot = session.bot
+    const channelId = session.channelId
+    if (!bot || !channelId) return
+    const full = refId ? appendRefId(content, refId) : content
+    const payload = shouldUseGroupReply(session, replyInGroupEnabled)
+      ? wrapForGroupReply(session, full)
+      : full
+    await bot.sendMessage(channelId, payload, session.guildId)
+  }
+
+  const scheduleChargeNotification = (
+    session: Session,
+    params: { chargeId: number; qrText: string; submitRefId?: string },
+  ) => {
+    if (isPublicApi) return
+    const bot = session.bot
+    const channelId = session.channelId
+    if (!bot || !channelId) return
+
+    const pollInterval = chargePollIntervalMs
+    const pollTimeout = chargePollTimeoutMs
+    const maxAttempts = Math.ceil(pollTimeout / pollInterval)
+    const clientId = machineInfo?.clientId ?? ''
+    let attempts = 0
+
+    const poll = async () => {
+      attempts += 1
+      try {
+        const q = await api.getChargeQueue()
+        if (q.code !== 0) {
+          if (attempts < maxAttempts) {
+            ctx.setTimeout(poll, pollInterval)
+          }
+          return
+        }
+
+        const task = findMatchingChargeTask(q.tasks, params.chargeId, params.qrText, clientId)
+        if (task?.status === 'done') {
+          const taskRefId = await logOperation({
+            command: 'mai发票-任务完成',
+            session,
+            status: 'success',
+            result: formatChargeTaskStatus(task),
+            apiResponse: { ...task, submitRefId: params.submitRefId },
+          })
+          await sendBotNotification(
+            session,
+            `✅ ${params.chargeId} 倍发票充值已完成\n${formatChargeTaskStatus(task)}\n请在游戏内确认到账`,
+            taskRefId,
+          )
+          return
+        }
+        if (task?.status === 'failed') {
+          const taskRefId = await logOperation({
+            command: 'mai发票-任务失败',
+            session,
+            status: 'failure',
+            result: formatChargeTaskStatus(task),
+            errorMessage: task.msg || '充值失败',
+            apiResponse: { ...task, submitRefId: params.submitRefId },
+          })
+          await sendBotNotification(
+            session,
+            `❌ ${params.chargeId} 倍发票充值失败\n${formatChargeTaskStatus(task)}${getErrorHelpInfo()}`,
+            taskRefId,
+          )
+          return
+        }
+
+        if (attempts < maxAttempts) {
+          ctx.setTimeout(poll, pollInterval)
+          return
+        }
+
+        const timeoutRefId = await logOperation({
+          command: 'mai发票-任务超时',
+          session,
+          status: 'failure',
+          errorMessage: `轮询超时（${Math.round(pollTimeout / 60000)} 分钟）`,
+          apiResponse: { chargeId: params.chargeId, submitRefId: params.submitRefId },
+        })
+        const hint = params.submitRefId
+          ? `\n可使用 /maiqueue ${params.submitRefId} 查询最新状态`
+          : ''
+        await sendBotNotification(
+          session,
+          `⏳ ${params.chargeId} 倍发票充值仍在处理或已移出队列（轮询 ${Math.round(pollTimeout / 60000)} 分钟）${hint}`,
+          timeoutRefId,
+        )
+      } catch (error) {
+        logger.warn(`轮询发票队列失败: ${sanitizeError(error)}`)
+        if (attempts < maxAttempts) {
+          ctx.setTimeout(poll, pollInterval)
+        }
+      }
+    }
+
+    ctx.setTimeout(poll, pollInterval)
+  }
+
   /**
    * 帮助指令
    * 用法: /mai 或 /mai帮助 [--advanced] 显示高级功能（发票、收藏品、舞里程等）
@@ -3488,7 +3672,7 @@ export function apply(ctx: Context, config: Config) {
   /mai状态 - 查询绑定状态
   /mymai - 与 /mai状态 相同（别名）
   /maiping - 测试机台连接
-  /maiqueue - 查询发票充值队列状态`)
+  /maiqueue [Ref_ID] - 查询发票充值队列状态（可带 Ref_ID 查单笔）`)
 
       // 有权限的代操作命令
       if (canProxy) {
@@ -3521,9 +3705,9 @@ export function apply(ctx: Context, config: Config) {
 
       if (canProxy) {
         helpText += `
-  /mai绑定落雪 <lxns_code> [@用户] - 为他人绑定落雪代码（需要auth等级${authLevelForProxy}以上）
-  /mai解绑落雪 [@用户] - 解绑他人的落雪代码（需要auth等级${authLevelForProxy}以上）
-  /mai上传落雪b50 [lxns_code] [@用户] - 为他人上传落雪B50（需要auth等级${authLevelForProxy}以上）`
+  /mai绑定落雪 <token> [@用户] - 为他人绑定落雪 Token（需要auth等级${authLevelForProxy}以上）
+  /mai解绑落雪 [@用户] - 解绑他人的落雪 Token（需要auth等级${authLevelForProxy}以上）
+  /mai上传落雪b50 [token] [@用户] - 为他人上传落雪B50（需要auth等级${authLevelForProxy}以上）`
       }
 
       // 只有在使用 --advanced 参数时才显示高级功能（发票、收藏品、舞里程等）
@@ -3637,6 +3821,7 @@ export function apply(ctx: Context, config: Config) {
   /mai管理员设置群组优先 <spec> [-g 群标识] — spec 与 -g 可同一段输入（如 clear -g qq:群号）；纯数字 -g 会按当前平台补前缀；-g 省略且在群内则当前群
   /maibypass <@用户|用户ID> — 清除该用户当前全部指令冷却（别名 /mai管理员清除冷却）
   /mai管理员重置用户协议 [all|@或ID] — 清除协议确认；all 重置全部用户（需二次确认）
+  /mai管理员清除落雪旧绑定 [legacy|all|@或ID] — 清除旧好友码；all 清除全部落雪绑定（需二次确认）
   /maiSGID获取 [文本|链接] — 调试 SGID 提取（auth≥3 或调试群；可交互发送文本/图片）`
       }
 
@@ -3713,10 +3898,10 @@ export function apply(ctx: Context, config: Config) {
 // 这个 Fracture_Hikaritsu 不给我吃KFC，故挂在此处。 我很生气。
   /**
    * 查询发票充值队列状态
-   * 用法: /maiqueue
+   * 用法: /maiqueue [Ref_ID]
    */
-  ctx.command('maiqueue', '查询发票充值队列状态')
-    .action(async ({ session }) => {
+  ctx.command('maiqueue [refId:text]', '查询发票充值队列状态')
+    .action(async ({ session }, refIdInput) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
@@ -3732,16 +3917,70 @@ export function apply(ctx: Context, config: Config) {
           if (q.code !== 0) {
             return '❌ 查询服务端发票队列失败'
           }
+
+          const refId = refIdInput?.trim()
+          if (refId) {
+            const logs = await ctx.database.get('maibot_operation_logs', { refId })
+            if (!logs.length) {
+              return `❌ 未找到 Ref_ID: ${refId}`
+            }
+            const log = logs[0]
+            let meta: { chargeId?: number; qrTextPrefix?: string; clientId?: string } = {}
+            if (log.apiResponse) {
+              try {
+                meta = JSON.parse(log.apiResponse)
+              } catch {
+                /* ignore */
+              }
+            }
+            if (!meta.chargeId) {
+              return `ℹ️ 该 Ref_ID 无发票队列信息\n指令: ${log.command}\n状态: ${log.status}`
+            }
+            const qrHint = meta.qrTextPrefix || ''
+            const task = findMatchingChargeTask(
+              q.tasks,
+              meta.chargeId,
+              qrHint,
+              meta.clientId || machineInfo?.clientId,
+            )
+            if (!task) {
+              const doneLogs = await ctx.database.get('maibot_operation_logs', {})
+              const followUp = doneLogs.find(
+                (row) => row.apiResponse?.includes(refId)
+                  && (row.command === 'mai发票-任务完成' || row.command === 'mai发票-任务失败'),
+              )
+              if (followUp) {
+                return `📋 发票任务（Ref_ID: ${refId}）\n${followUp.result || followUp.errorMessage || followUp.status}`
+              }
+              return `ℹ️ 服务端队列中未找到该笔任务（可能已完成并移出队列）\nRef_ID: ${refId}\n提交指令: ${log.command}`
+            }
+            return `📋 发票任务（Ref_ID: ${refId}）\n${formatChargeTaskStatus(task)}\n更新时间: ${task.ts}`
+          }
+
           const pending = q.tasks.filter(t => t.status === 'pending').length
           const processing = q.tasks.filter(t => t.status === 'processing').length
           const failed = q.tasks.filter(t => t.status === 'failed').length
           let msg = `📋 发票充值队列（服务端）\nWorker 数: ${q.workers}\n排队中: ${pending} · 处理中: ${processing}`
           if (failed > 0) msg += ` · 最近失败: ${failed}`
+
+          const binding = await getBindingBySession(ctx, session)
+          const qrText = binding?.lastQrCode?.trim()
+          if (qrText?.startsWith('SGWCMAID')) {
+            const mine = q.tasks.filter(
+              (t) => findMatchingChargeTask([t], t.chargeId, qrText, machineInfo?.clientId),
+            )
+            if (mine.length) {
+              msg += '\n\n📌 与您最近 SGID 相关的任务：'
+              for (const t of mine.slice(0, 3)) {
+                msg += `\n· ${formatChargeTaskStatus(t)}（${t.ts}）`
+              }
+            }
+          }
+
           if (pending + processing === 0) {
             msg += '\n当前无等待中的充值任务'
-          } else {
-            msg += '\n\n说明：B50 上传为同步处理，不走此队列；仅 /mai发票 使用充值队列。'
           }
+          msg += '\n\n说明：B50 上传不走此队列；可用 /maiqueue <Ref_ID> 查询单笔发票状态。'
           return msg
         } catch (error: any) {
           return `❌ 查询发票队列失败: ${getSafeErrorMessage(error, session)}`
@@ -4302,11 +4541,11 @@ export function apply(ctx: Context, config: Config) {
           statusInfo += `\n\n🐟 水鱼Token: 未绑定\n使用 /mai绑定水鱼 <token> 进行绑定`
         }
 
-        // 显示落雪代码绑定状态
+        // 显示落雪 Token 绑定状态
         if (binding.lxnsCode) {
-          statusInfo += `\n\n❄️ 落雪代码: 已绑定`
+          statusInfo += `\n\n❄️ 落雪 Token: 已绑定`
         } else {
-          statusInfo += `\n\n❄️ 落雪代码: 未绑定\n使用 /mai绑定落雪 <lxns_code> 进行绑定`
+          statusInfo += `\n\n❄️ 落雪 Token: 未绑定\n使用 /mai绑定落雪 <token> 进行绑定`
         }
 
         // 显示保护模式状态（如果未隐藏）
@@ -4736,12 +4975,12 @@ export function apply(ctx: Context, config: Config) {
     })
 
   /**
-   * 绑定落雪代码
-   * 用法: /mai绑定落雪 [lxnsCode]
+   * 绑定落雪 Token
+   * 用法: /mai绑定落雪 [token]
    */
-  ctx.command('mai绑定落雪 [lxnsCode:text] [targetUserId:text]', '绑定落雪代码用于B50上传')
+  ctx.command('mai绑定落雪 [lxnsToken:text] [targetUserId:text]', '绑定落雪 Token 用于 B50 上传')
     .userFields(['authority'])
-    .action(async ({ session }, lxnsCode, targetUserId) => {
+    .action(async ({ session }, lxnsToken, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
@@ -4761,11 +5000,14 @@ export function apply(ctx: Context, config: Config) {
 
         const userId = binding.userId
 
-        // 如果没有提供落雪代码，提示用户交互式输入
-        if (!lxnsCode) {
+        // 如果没有提供落雪 Token，提示用户交互式输入
+        if (!lxnsToken) {
           const actualTimeout = rebindTimeout
           try {
-            await session.send(`请在${actualTimeout / 1000}秒内发送落雪代码（长度必须为15个字符）`)
+            await session.send(
+              `请在${actualTimeout / 1000}秒内发送落雪 Token\n` +
+              `获取地址：${LXNS_TOKEN_HINT_URL}`,
+            )
             
             const promptSession = await waitForUserReply(session, ctx, actualTimeout)
             const promptText = promptSession?.content?.trim() || ''
@@ -4773,13 +5015,13 @@ export function apply(ctx: Context, config: Config) {
               return `❌ 输入超时（${actualTimeout / 1000}秒），绑定已取消`
             }
 
-            lxnsCode = promptText.trim()
+            lxnsToken = promptText.trim()
             // 交互式输入的敏感信息，撤回用户输入消息
             if (promptSession) {
               await tryRecallMessage(promptSession, ctx, config, promptSession.messageId)
             }
           } catch (error: any) {
-            logger.error(`等待用户输入落雪代码失败: ${error?.message}`, error)
+            logger.error(`等待用户输入落雪 Token 失败: ${error?.message}`, error)
             if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
               return `❌ 输入超时（${actualTimeout / 1000}秒），绑定已取消`
             }
@@ -4790,19 +5032,18 @@ export function apply(ctx: Context, config: Config) {
         // 命令参数的敏感信息，尝试撤回
         await tryRecallMessage(session, ctx, config)
 
-        // 验证代码长度
-        if (lxnsCode.length !== 15) {
-          return '❌ 落雪代码长度错误，必须为15个字符'
+        if (!isValidLxnsToken(lxnsToken)) {
+          return lxnsTokenFormatError()
         }
 
-        // 更新落雪代码
+        // 更新落雪 Token（数据库字段 lxnsCode 保留兼容）
         await ctx.database.set('maibot_bindings', { userId }, {
-          lxnsCode,
+          lxnsCode: lxnsToken.trim(),
         })
 
-        return `✅ 落雪代码绑定成功！\n代码: ${lxnsCode.substring(0, 5)}***${lxnsCode.substring(lxnsCode.length - 3)}`
+        return `✅ 落雪 Token 绑定成功！\nToken: ${maskLxnsToken(lxnsToken)}`
       } catch (error: any) {
-        ctx.logger('maibot').error('绑定落雪代码失败:', error)
+        ctx.logger('maibot').error('绑定落雪 Token 失败:', error)
         if (maintenanceMode) {
           return maintenanceMessage
         }
@@ -4811,10 +5052,10 @@ export function apply(ctx: Context, config: Config) {
     })
 
   /**
-   * 解绑落雪代码
+   * 解绑落雪 Token
    * 用法: /mai解绑落雪
    */
-  ctx.command('mai解绑落雪 [targetUserId:text]', '解绑落雪代码（保留舞萌DX账号绑定）')
+  ctx.command('mai解绑落雪 [targetUserId:text]', '解绑落雪 Token（保留舞萌DX账号绑定）')
     .userFields(['authority'])
     .action(async ({ session }, targetUserId) => {
       if (!session) {
@@ -4830,19 +5071,19 @@ export function apply(ctx: Context, config: Config) {
 
         const userId = binding.userId
 
-        // 检查是否已绑定落雪代码
+        // 检查是否已绑定落雪 Token
         if (!binding.lxnsCode) {
-          return '❌ 您还没有绑定落雪代码\n使用 /mai绑定落雪 <lxns_code> 进行绑定'
+          return '❌ 您还没有绑定落雪 Token\n使用 /mai绑定落雪 <token> 进行绑定'
         }
 
-        // 清除落雪代码（设置为空字符串）
+        // 清除落雪 Token
         await ctx.database.set('maibot_bindings', { userId }, {
           lxnsCode: '',
         })
 
-        return `✅ 落雪代码解绑成功！\n已解绑的代码: ${binding.lxnsCode.substring(0, 5)}***${binding.lxnsCode.substring(binding.lxnsCode.length - 3)}\n\n舞萌DX账号绑定仍保留`
+        return `✅ 落雪 Token 解绑成功！\n已解绑: ${maskLxnsToken(binding.lxnsCode)}\n\n舞萌DX账号绑定仍保留`
       } catch (error: any) {
-        ctx.logger('maibot').error('解绑落雪代码失败:', error)
+        ctx.logger('maibot').error('解绑落雪 Token 失败:', error)
         if (maintenanceMode) {
           return maintenanceMessage
         }
@@ -5006,14 +5247,27 @@ export function apply(ctx: Context, config: Config) {
 
         const successMessage = isPublicApi
           ? `✅ 已发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
-          : `✅ ${multiple} 倍发票已加入充值队列${ticketResult.queueMsg ? `\n${ticketResult.queueMsg}` : ''}\n后台处理约需 2–3 分钟，请在游戏内确认到账`
+          : `✅ ${multiple} 倍发票已加入充值队列${ticketResult.queueMsg ? `\n${ticketResult.queueMsg}` : ''}\n后台处理约需 2–3 分钟，完成后将 @ 您通知`
         const refId = await logOperation({
           command: 'mai发票',
           session,
           targetUserId,
           status: 'success',
           result: successMessage,
+          apiResponse: {
+            chargeId: multiple,
+            qrTextPrefix: qrTextResult.qrText.substring(0, 48),
+            clientId: machineInfo?.clientId,
+            queueMsg: ticketResult.queueMsg,
+          },
         })
+        if (!isPublicApi) {
+          scheduleChargeNotification(session, {
+            chargeId: multiple,
+            qrText: qrTextResult.qrText,
+            submitRefId: refId,
+          })
+        }
         return appendRefId(successMessage, refId)
       } catch (error: any) {
         logger.error(`发票失败: ${sanitizeError(error)}`)
@@ -5329,9 +5583,9 @@ export function apply(ctx: Context, config: Config) {
       }
 
       try {
-        // 解析参数：可能是SGID/URL或落雪代码或目标用户
+        // 解析参数：可能是 SGID/URL、落雪 Token 或目标用户
         let qrCode: string | undefined
-        let lxnsCode: string | undefined
+        let lxnsToken: string | undefined
         let actualTargetUserId: string | undefined = targetUserId
 
         if (qrCodeOrLxnsCode) {
@@ -5339,8 +5593,8 @@ export function apply(ctx: Context, config: Config) {
           if (processed) {
             await tryRecallMessage(session, ctx, config)
             qrCode = processed.qrText
-          } else if (qrCodeOrLxnsCode.length === 15) {
-            lxnsCode = qrCodeOrLxnsCode
+          } else if (isValidLxnsToken(qrCodeOrLxnsCode)) {
+            lxnsToken = qrCodeOrLxnsCode.trim()
           } else {
             actualTargetUserId = qrCodeOrLxnsCode
           }
@@ -5354,17 +5608,20 @@ export function apply(ctx: Context, config: Config) {
         const userId = binding.userId
         const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
 
-        if (!binding.fishToken && !binding.lxnsCode && !lxnsCode) {
-          return '❌ 请先绑定水鱼Token和落雪代码\n使用 /mai绑定水鱼 <token> 和 /mai绑定落雪 <lxns_code> 进行绑定'
+        if (!binding.fishToken && !binding.lxnsCode && !lxnsToken) {
+          return '❌ 请先绑定水鱼 Token 和落雪 Token\n使用 /mai绑定水鱼 <token> 和 /mai绑定落雪 <token> 进行绑定'
         }
         if (!binding.fishToken) {
-          return '❌ 请先绑定水鱼Token\n使用 /mai绑定水鱼 <token> 进行绑定'
+          return '❌ 请先绑定水鱼 Token\n使用 /mai绑定水鱼 <token> 进行绑定'
         }
         const fishToken = binding.fishToken as string
 
-        const finalLxnsCode = lxnsCode || binding.lxnsCode
-        if (!finalLxnsCode) {
-          return '❌ 请先绑定落雪代码或提供落雪代码参数\n使用 /mai绑定落雪 <lxns_code> 进行绑定\n或使用 /maiua <lxns_code> 直接提供代码'
+        const finalLxnsToken = lxnsToken || binding.lxnsCode
+        if (!finalLxnsToken) {
+          return '❌ 请先绑定落雪 Token 或在指令中提供\n使用 /mai绑定落雪 <token> 或 /maiua <token>'
+        }
+        if (lxnsToken && !isValidLxnsToken(finalLxnsToken)) {
+          return lxnsTokenFormatError()
         }
 
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
@@ -5502,7 +5759,7 @@ export function apply(ctx: Context, config: Config) {
             machineInfo.clientId,
             machineInfo.placeId,
             qrTextResult.qrText,
-            finalLxnsCode
+            finalLxnsToken
           )
 
           // 如果使用了缓存且失败，尝试重新获取SGID
@@ -5518,7 +5775,7 @@ export function apply(ctx: Context, config: Config) {
                 machineInfo.clientId,
                 machineInfo.placeId,
                 retryQrText.qrText,
-                finalLxnsCode
+                finalLxnsToken
               )
             }
           }
@@ -5562,7 +5819,7 @@ export function apply(ctx: Context, config: Config) {
                   machineInfo.clientId,
                   machineInfo.placeId,
                   retryQrText.qrText,
-                  finalLxnsCode
+                  finalLxnsToken
                 )
                 if (!lxResult.UploadStatus) {
                   if (lxResult.msg === '该账号下存在未完成的任务') {
@@ -6512,7 +6769,7 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 上传落雪B50
-   * 用法: /mai上传落雪b50 [lxns_code] [@用户id]
+   * 用法: /mai上传落雪b50 [token] [@用户id]
    */
   ctx.command('mai上传落雪b50 [qrCodeOrLxnsCode:text] [targetUserId:text]', '上传B50数据到落雪')
     .alias('maiul')
@@ -6528,25 +6785,24 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
-      // 解析参数：第一个参数可能是SGID/URL或落雪代码
+      // 解析参数：第一个参数可能是 SGID/URL 或落雪 Token
       let qrCode: string | undefined
-      let lxnsCode: string | undefined
+      let lxnsToken: string | undefined
       let actualTargetUserId: string | undefined = targetUserId
 
       try {
         
-        // 检查第一个参数是否是SGID或URL
+        // 检查第一个参数是否是 SGID、URL 或落雪 Token
         if (qrCodeOrLxnsCode) {
           const processed = processSGID(qrCodeOrLxnsCode)
           if (processed) {
-            // 是SGID或URL，尝试撤回
+            // 是 SGID 或 URL，尝试撤回
             await tryRecallMessage(session, ctx, config)
             qrCode = processed.qrText
-          } else if (qrCodeOrLxnsCode.length === 15) {
-            // 可能是落雪代码（15个字符）
-            lxnsCode = qrCodeOrLxnsCode
+          } else if (isValidLxnsToken(qrCodeOrLxnsCode)) {
+            lxnsToken = qrCodeOrLxnsCode.trim()
           } else {
-            // 可能是targetUserId
+            // 可能是 targetUserId
             actualTargetUserId = qrCodeOrLxnsCode
           }
         }
@@ -6559,17 +6815,18 @@ export function apply(ctx: Context, config: Config) {
 
         const userId = binding.userId
 
-        // 确定使用的落雪代码
-        let finalLxnsCode: string
-        if (lxnsCode) {
-          // 如果提供了参数，使用参数
-          finalLxnsCode = lxnsCode
+        // 确定使用的落雪 Token
+        let finalLxnsToken: string
+        if (lxnsToken) {
+          finalLxnsToken = lxnsToken
         } else {
-          // 如果没有提供参数，使用绑定的代码
           if (!binding.lxnsCode) {
-            return '❌ 请先绑定落雪代码或提供落雪代码参数\n使用 /mai绑定落雪 <lxns_code> 进行绑定\n或使用 /mai上传落雪b50 <lxns_code> 直接提供代码'
+            return '❌ 请先绑定落雪 Token 或在指令中提供\n使用 /mai绑定落雪 <token> 或 /mai上传落雪b50 <token>'
           }
-          finalLxnsCode = binding.lxnsCode
+          finalLxnsToken = binding.lxnsCode
+        }
+        if (!isValidLxnsToken(finalLxnsToken)) {
+          return lxnsTokenFormatError()
         }
 
         // 维护时间内直接提示，不发起上传请求
@@ -6605,7 +6862,7 @@ export function apply(ctx: Context, config: Config) {
             machineInfo.clientId,
             machineInfo.placeId,
             qrTextResult.qrText,
-            finalLxnsCode
+            finalLxnsToken
           )
         } catch (error: any) {
           if (usedCache) {
@@ -6620,7 +6877,7 @@ export function apply(ctx: Context, config: Config) {
               machineInfo.clientId,
               machineInfo.placeId,
               retryQrText.qrText,
-              finalLxnsCode
+              finalLxnsToken
             )
           } else {
             throw error
@@ -6641,7 +6898,7 @@ export function apply(ctx: Context, config: Config) {
               machineInfo.clientId,
               machineInfo.placeId,
               retryQrText.qrText,
-              finalLxnsCode
+              finalLxnsToken
             )
             if (!result.UploadStatus) {
               if (result.msg === '该账号下存在未完成的任务') {
@@ -8352,6 +8609,63 @@ export function apply(ctx: Context, config: Config) {
       }
       const removed = await clearUserCooldownsForKeys(ctx, candidates)
       return `✅ 已清除 ${removed} 条冷却记录。\n尝试匹配的用户键：${candidates.join('、')}`
+    })
+
+  ctx.command('mai管理员清除落雪旧绑定 [target:text]', '清除旧版落雪好友码；all 清除全部落雪绑定')
+    .userFields(['authority'])
+    .action(async ({ session }, target) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < authLevelForProxy) {
+        return `❌ 权限不足，需要 auth 等级 ${authLevelForProxy} 以上`
+      }
+
+      const arg = (target || '').trim()
+      const lower = arg.toLowerCase()
+
+      if (lower === 'all') {
+        const confirmed = await promptYesLocal(
+          session,
+          '⚠️ 即将清除【所有用户】的落雪绑定（含有效 Token），所有人须重新 /mai绑定落雪',
+        )
+        if (!confirmed) return '已取消'
+        const count = await purgeAllLxnsBindings(ctx)
+        return count > 0
+          ? `✅ 已清除 ${count} 条落雪绑定（含 Token）`
+          : 'ℹ️ 当前没有任何落雪绑定记录'
+      }
+
+      if (!arg || lower === 'legacy' || lower === '旧') {
+        const confirmed = await promptYesLocal(
+          session,
+          '⚠️ 即将清除所有用户的【旧版落雪好友码】绑定（有效 Token 保留）',
+        )
+        if (!confirmed) return '已取消'
+        const count = await purgeInvalidLxnsBindings(ctx)
+        return count > 0
+          ? `✅ 已清除 ${count} 条旧版落雪好友码，请通知用户用 Token 重新 /mai绑定落雪`
+          : 'ℹ️ 当前没有需要清除的旧版落雪好友码'
+      }
+
+      const candidates = await resolveCooldownKeyCandidatesForBypass(session, arg)
+      if (!candidates.length) {
+        return '❌ 无法解析目标用户，请使用 @用户 或数字 ID'
+      }
+
+      let cleared = 0
+      let skipped = 0
+      for (const key of candidates) {
+        const result = await clearUserLxnsBinding(ctx, key, true)
+        if (result === 'cleared') cleared++
+        else if (result === 'skipped') skipped++
+      }
+
+      if (cleared > 0) {
+        return `✅ 已清除 ${cleared} 条旧版落雪绑定${skipped > 0 ? `（${skipped} 条已是有效 Token，未动）` : ''}\n匹配键：${candidates.join('、')}`
+      }
+      if (skipped > 0) {
+        return `ℹ️ 该用户已绑定有效落雪 Token，请使用 /mai解绑落雪 或由管理员执行 /mai管理员清除落雪旧绑定 all（慎用）`
+      }
+      return `ℹ️ 未找到落雪绑定记录。\n匹配键：${candidates.join('、')}`
     })
 
   ctx.command('mai管理员重置用户协议 [targetUserId:text]', '清除目标用户的协议确认记录，使其下次使用时重新确认')

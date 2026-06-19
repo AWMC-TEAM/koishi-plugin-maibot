@@ -9,7 +9,7 @@ export interface UserBinding {
   userName?: string  // 用户名（从preview获取）
   rating?: string    // Rating（从preview获取）
   fishToken?: string // 水鱼Token
-  lxnsCode?: string  // 落雪代码
+  lxnsCode?: string  // 落雪 Token（V2；字段名保留兼容）
   alertEnabled?: boolean  // 是否启用播报（默认false）
   lastLoginStatus?: boolean  // 上一次登录状态
   guildId?: string  // 群组ID（用于发送消息）
@@ -141,7 +141,7 @@ export function extendDatabase(ctx: Context) {
     userName: 'string',
     rating: 'string',
     fishToken: 'string', // 水鱼Token
-    lxnsCode: 'string',  // 落雪代码
+    lxnsCode: 'string',  // 落雪 Token
     alertEnabled: 'boolean',  // 是否启用播报
     lastLoginStatus: 'boolean',  // 上一次登录状态
     guildId: 'string',  // 群组ID

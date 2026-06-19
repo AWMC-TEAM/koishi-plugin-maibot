@@ -29,6 +29,53 @@ export function isSyncB50Upload(result: { sync?: boolean }): boolean {
   return result.sync === true
 }
 
+export interface ChargeQueueTask {
+  chargeId: number
+  userId: string
+  keychip: string
+  qrToken?: string
+  regionId?: number
+  placeId?: number
+  status: 'pending' | 'processing' | 'done' | 'failed'
+  msg: string
+  ts: string
+}
+
+export function findMatchingChargeTask(
+  tasks: ChargeQueueTask[],
+  chargeId: number,
+  qrText: string,
+  clientId?: string,
+): ChargeQueueTask | undefined {
+  const sorted = [...tasks].sort(
+    (a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime(),
+  )
+  return sorted.find((t) => {
+    if (t.chargeId !== chargeId) return false
+    const token = (t.qrToken || '').trim()
+    const qr = qrText.trim()
+    if (token && qr) {
+      if (token === qr) return true
+      if (qr.startsWith(token) || token.startsWith(qr)) return true
+      if (qr.length <= 64 && token.startsWith(qr)) return true
+    }
+    if (clientId && t.keychip === clientId && !token) return true
+    return false
+  })
+}
+
+export function formatChargeTaskStatus(task: ChargeQueueTask): string {
+  const statusLabel: Record<ChargeQueueTask['status'], string> = {
+    pending: '排队中',
+    processing: '处理中',
+    done: '已完成',
+    failed: '失败',
+  }
+  const base = `${task.chargeId} 倍 · ${statusLabel[task.status]}`
+  if (task.msg?.trim()) return `${base}（${task.msg.trim()}）`
+  return base
+}
+
 /** 调试上下文：在 API 调用栈中传递「来源是否为调试会话」的标记 */
 export const debugContextStorage = new AsyncLocalStorage<{ fromDebugSession: boolean }>()
 
@@ -599,17 +646,7 @@ export class MaiBotAPI {
   async getChargeQueue(): Promise<{
     code: number
     workers: number
-    tasks: Array<{
-      chargeId: number
-      userId: string
-      keychip: string
-      qrToken?: string
-      regionId?: number
-      placeId?: number
-      status: 'pending' | 'processing' | 'done' | 'failed'
-      msg: string
-      ts: string
-    }>
+    tasks: ChargeQueueTask[]
   }> {
     const response = await this.client.get(this.swPath('/charge/queue'))
     return response.data

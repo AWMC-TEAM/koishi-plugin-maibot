@@ -1,4 +1,75 @@
+import type { Context } from 'koishi'
 import type { UserBinding } from './database'
+
+export const LXNS_TOKEN_HINT_URL = 'https://maimai.lxns.net/user/profile?tab=thirdparty'
+
+/** 落雪 Token（个人中心第三方导入，非旧版 15 位好友码） */
+export function isValidLxnsToken(token: string): boolean {
+  const t = token.trim()
+  if (t.length < 32 || t.length > 128) return false
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(t)) return false
+  if (t.startsWith('SGWCMAID') || t.startsWith('MAID')) return false
+  return true
+}
+
+/** 仍为旧版落雪好友码等非 Token 格式 */
+export function isLegacyLxnsFriendCode(code: string | undefined | null): boolean {
+  const t = (code || '').trim()
+  if (!t) return false
+  return !isValidLxnsToken(t)
+}
+
+export function maskLxnsToken(token: string): string {
+  const t = token.trim()
+  if (t.length <= 10) return '***'
+  return `${t.slice(0, 6)}***${t.slice(-4)}`
+}
+
+export function lxnsTokenFormatError(): string {
+  return (
+    '❌ 落雪 Token 格式无效\n' +
+    '请在落雪个人中心获取 Token（类似 2sDHRYucFS03HGBbw0naqyHpRxQSFPbhMlbO4vmWQUo=）\n' +
+    LXNS_TOKEN_HINT_URL
+  )
+}
+
+/** 清除所有非 Token 格式的落雪绑定（旧好友码等） */
+export async function purgeInvalidLxnsBindings(ctx: Context): Promise<number> {
+  const rows = await ctx.database.get('maibot_bindings', {})
+  let cleared = 0
+  for (const row of rows) {
+    if (!isLegacyLxnsFriendCode(row.lxnsCode)) continue
+    await ctx.database.set('maibot_bindings', { userId: row.userId }, { lxnsCode: '' })
+    cleared++
+  }
+  return cleared
+}
+
+/** 清除指定用户的落雪绑定；legacyOnly 为 true 时仅清除旧好友码 */
+export async function clearUserLxnsBinding(
+  ctx: Context,
+  userId: string,
+  legacyOnly: boolean,
+): Promise<'none' | 'skipped' | 'cleared'> {
+  const rows = await ctx.database.get('maibot_bindings', { userId })
+  if (!rows.length || !rows[0].lxnsCode?.trim()) return 'none'
+  const code = rows[0].lxnsCode.trim()
+  if (legacyOnly && isValidLxnsToken(code)) return 'skipped'
+  await ctx.database.set('maibot_bindings', { userId }, { lxnsCode: '' })
+  return 'cleared'
+}
+
+/** 清除全部用户的落雪绑定 */
+export async function purgeAllLxnsBindings(ctx: Context): Promise<number> {
+  const rows = await ctx.database.get('maibot_bindings', {})
+  let cleared = 0
+  for (const row of rows) {
+    if (!row.lxnsCode?.trim()) continue
+    await ctx.database.set('maibot_bindings', { userId: row.userId }, { lxnsCode: '' })
+    cleared++
+  }
+  return cleared
+}
 
 /** 是否已完成舞萌 DX 账号绑定（非仅 Token 占位记录） */
 export function isDxBound(binding: UserBinding | null | undefined): boolean {
