@@ -420,24 +420,27 @@ const MAI_SESSION_CMD_USAGE_KEY = '__maiCmdUsageHint'
 const MAI_GUILD_REPLY_KEY = '__maiGuildReplyEnabled'
 const MAI_TRIGGER_USER_ID = '__maiTriggerUserId'
 const MAI_TRIGGER_MESSAGE_ID = '__maiTriggerMessageId'
-const MAI_ORIGINAL_SEND = '__maiOriginalSessionSend'
 
 type StrippedSession = Session & { stripped?: { content?: string; prefix?: string } }
 
-/** 去掉 Koishi 指令前缀后的正文（如 .maiu → maiu） */
+/** 去掉 Koishi 指令前缀后的正文（支持空 / 空格 / . / 等前缀） */
 function getMaiMessageBody(session: Session): string {
   const s = session as StrippedSession
-  const raw = (s.stripped?.content ?? session.content ?? '').trim()
+  let raw = s.stripped?.content ?? session.content ?? ''
   const prefix = s.stripped?.prefix
-  if (prefix && raw.startsWith(prefix)) {
-    return raw.slice(prefix.length).trimStart()
+  if (typeof prefix === 'string' && prefix.length > 0 && raw.startsWith(prefix)) {
+    raw = raw.slice(prefix.length)
   }
-  return raw
+  return raw.trimStart()
 }
 
 /** 是否为 mai 插件相关用户消息（含别名 maiu / maiul 等） */
 function isMaiUserMessage(session: Session): boolean {
-  return /^\/?mai/i.test(getMaiMessageBody(session))
+  const body = getMaiMessageBody(session)
+  if (/^\/?mai/i.test(body)) return true
+  const argv = (session as { argv?: { command?: { name?: string } } }).argv
+  const name = argv?.command?.name
+  return !!name && isMaiPluginCommandName(name)
 }
 
 /** 去掉前缀与参数后的 mai 指令名（如 maiu、mai上传B50） */
@@ -445,14 +448,26 @@ function getMaiCommandName(session: Session): string {
   return getMaiMessageBody(session).replace(/^\//, '').split(/\s+/)[0] || ''
 }
 
-/** 解析可用于 @ 的平台用户 ID（优先纯数字 QQ 号） */
+/** 解析可用于 @ 的平台用户 ID（OneBot 优先 QQ 号） */
 function resolveAtUserId(session: Session): string | null {
   const bag = session as unknown as Record<string, unknown>
+  const event = (session as {
+    event?: {
+      user_id?: unknown
+      user?: { id?: unknown }
+      member?: { user_id?: unknown; user?: { id?: unknown } }
+    }
+  }).event
   const candidates = [
     bag[MAI_TRIGGER_USER_ID],
-    session.userId,
     session.author?.userId,
+    (session.author as { id?: unknown } | undefined)?.id,
+    session.userId,
     (session as { uid?: string }).uid,
+    event?.user_id,
+    event?.user?.id,
+    event?.member?.user_id,
+    event?.member?.user?.id,
   ]
   for (const raw of candidates) {
     if (raw === undefined || raw === null || raw === '') continue
@@ -470,12 +485,15 @@ function resolveTriggerMessageId(session: Session): string | undefined {
   if (stored !== undefined && stored !== null && stored !== '') {
     return String(stored)
   }
-  const mid = session.messageId
-  if (mid !== undefined && mid !== null && mid !== '') {
-    return String(mid)
-  }
-  const event = (session as { event?: { message?: { id?: unknown }; messageId?: unknown } }).event
-  for (const raw of [event?.message?.id, event?.messageId]) {
+  const msg = (session as { event?: { message?: Record<string, unknown>; messageId?: unknown } }).event?.message
+  const event = (session as { event?: { messageId?: unknown } }).event
+  for (const raw of [
+    session.messageId,
+    msg?.id,
+    msg?.messageId,
+    msg?.message_id,
+    event?.messageId,
+  ]) {
     if (raw !== undefined && raw !== null && raw !== '') {
       return String(raw)
     }
@@ -503,11 +521,41 @@ function fragmentAlreadyQuoted(content: unknown): boolean {
   return visit(content)
 }
 
-/** 群聊回复：暂存触发消息元数据并包装 session.send */
+function fragmentAlreadyHasAt(content: unknown, atId: string): boolean {
+  const visit = (node: unknown): boolean => {
+    if (!node || typeof node !== 'object') return false
+    const el = node as { type?: string; attrs?: { id?: unknown } }
+    if (el.type === 'at' && String(el.attrs?.id ?? '') === atId) return true
+    if (Array.isArray(node)) return node.some(visit)
+    const children = (node as { children?: unknown[] }).children
+    if (Array.isArray(children)) return children.some(visit)
+    return false
+  }
+  return visit(content)
+}
+
+function prependGroupReplyElements(source: Session, target: { elements?: unknown[] }): void {
+  const elements = target.elements
+  if (!elements?.length) return
+
+  const atId = resolveAtUserId(source)
+  const messageId = resolveTriggerMessageId(source)
+  const prefix: unknown[] = []
+
+  if (messageId && !fragmentAlreadyQuoted(elements)) {
+    prefix.push(h.quote(String(messageId)))
+  }
+  if (atId && !fragmentAlreadyHasAt(elements, atId)) {
+    prefix.push(h.at(atId), '\n')
+  }
+  if (prefix.length === 0) return
+  target.elements = [...prefix, ...elements]
+}
+
+/** 群聊回复：暂存触发消息元数据（发送时由 before-send 统一加引用与 @） */
 function prepareGroupReplySession(session: Session, replyInGroup: boolean): void {
   if (!shouldUseGroupReply(session, replyInGroup)) return
   stashTriggerSessionMeta(session)
-  patchSessionSendForGroupReply(session)
 }
 
 function shouldUseGroupReply(session: Session, replyInGroup: boolean): boolean {
@@ -547,16 +595,6 @@ function wrapForGroupReply(session: Session, content: unknown): Fragment {
 
   if (parts.length === 0) return ''
   return parts as Fragment
-}
-
-function patchSessionSendForGroupReply(session: Session): void {
-  const bag = session as unknown as Record<string, unknown>
-  if (bag[MAI_ORIGINAL_SEND]) return
-  const originalSend = session.send.bind(session)
-  bag[MAI_ORIGINAL_SEND] = originalSend
-  session.send = async (content: unknown) => {
-    return originalSend(wrapForGroupReply(session, content))
-  }
 }
 
 function enableGuildReplyOnSession(session: Session, replyInGroup: boolean): void {
@@ -2167,6 +2205,16 @@ export function apply(ctx: Context, config: Config) {
   const chargePollIntervalMs = config.chargePollInterval ?? 3000
   const chargePollTimeoutMs = config.chargePollTimeout ?? 180000
 
+  /** 群聊内所有 Bot 发送（含交互提示、处理中、命令返回值）统一加引用与 @ */
+  ctx.on('before-send', (sendSession: Session, options?: { session?: Session }) => {
+    const source = options?.session
+    if (!source || !shouldUseGroupReply(source, replyInGroupEnabled)) return
+    const bag = source as unknown as Record<string, unknown>
+    if (!bag[MAI_GUILD_REPLY_KEY]) return
+    stashTriggerSessionMeta(source)
+    prependGroupReplyElements(source, sendSession as { elements?: unknown[] })
+  })
+
   // 错误帮助URL配置
   const errorHelpUrl = config.errorHelpUrl || ''
 
@@ -3108,8 +3156,7 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 群聊：mai 指令回复引用原消息并 @ 发送者。
-   * 通过包装 session.send 生效（含 Koishi 在 middleware 结束后发送的命令返回值），
-   * 不在 finally 中 restore，避免最终 session.send(result) 时包装已失效。
+   * 标记会话后由 before-send 统一包装所有出站消息（含 SGID 提示、B50 结果等）。
    */
   ctx.middleware(async (session, next) => {
     if (!isMaiUserMessage(session)) return next()
@@ -3641,10 +3688,11 @@ export function apply(ctx: Context, config: Config) {
     const channelId = session.channelId
     if (!bot || !channelId) return
     const full = refId ? appendRefId(content, refId) : content
-    const payload = shouldUseGroupReply(session, replyInGroupEnabled)
-      ? wrapForGroupReply(session, full)
-      : full
-    await bot.sendMessage(channelId, payload, session.guildId)
+    stashTriggerSessionMeta(session)
+    if (shouldUseGroupReply(session, replyInGroupEnabled)) {
+      enableGuildReplyOnSession(session, true)
+    }
+    await bot.sendMessage(channelId, full, session.guildId, { session })
   }
 
   const scheduleChargeNotification = (
