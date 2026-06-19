@@ -1,5 +1,13 @@
 import type { UserBinding } from './database'
 
+/** 是否已完成舞萌 DX 账号绑定（非仅 Token 占位记录） */
+export function isDxBound(binding: UserBinding | null | undefined): boolean {
+  if (!binding) return false
+  const qr = (binding.qrCode || '').trim()
+  const uid = (binding.maiUid || '').trim()
+  return qr.startsWith('SGWCMAID') && uid.length > 0
+}
+
 export function normalizePreviewUserId(userId: string | number): string {
   return String(userId)
 }

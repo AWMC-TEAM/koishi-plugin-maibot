@@ -106,6 +106,8 @@ export interface MaiBotUserTerms {
   acceptedAt: Date
   /** 接受时的协议版本号，与配置 termsPolicy.version 比对 */
   termsVersion?: string
+  /** 已确认的测试阶段提示版本，与配置 betaNotice.version 比对 */
+  betaNoticeVersion?: string
 }
 
 export interface MaiBotV2Migration {
@@ -252,6 +254,7 @@ export function extendDatabase(ctx: Context) {
     userId: 'string',
     acceptedAt: 'timestamp',
     termsVersion: 'string',
+    betaNoticeVersion: 'string',
   }, {
     primary: 'userId',
   })

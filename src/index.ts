@@ -2,6 +2,7 @@ import { Context, Schema, Session } from 'koishi'
 import { MaiBotAPI, isSyncB50Upload } from './api'
 import {
   formatBindChangeWaitHuman,
+  isDxBound,
   msUntilBindChangeAllowed,
   verifyPreviewMatchesBinding,
   type VerifyPreviewBindingResult,
@@ -140,6 +141,13 @@ export interface Config {
   }
   /** 交互式提示/处理中消息完成后自动撤回（仅保留结果） */
   autoRecallInteractiveMessages?: boolean
+  /** Token 直连模式：无需 /mai绑定，仅按 userId 绑定水鱼/落雪，且只开放 B50 与发票 */
+  tokenOnlyMode?: boolean
+  /** 测试阶段提示：首次使用功能前警示，版本变更后需重新确认 */
+  betaNotice?: {
+    enabled?: boolean
+    version?: string
+  }
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -298,6 +306,16 @@ export const Config: Schema<Config> = Schema.object({
     version: '2.0.0',
   }),
   autoRecallInteractiveMessages: Schema.boolean().default(true).description('交互式提示与处理中消息完成后自动撤回，仅保留最终结果'),
+  tokenOnlyMode: Schema.boolean().default(false).description(
+    'Token 直连模式：关闭舞萌绑定，用户仅按 userId 绑定水鱼/落雪 Token，且只能使用 B50 上传与发票；关闭本模式后，未完成舞萌绑定的用户须 /mai绑定',
+  ),
+  betaNotice: Schema.object({
+    enabled: Schema.boolean().default(true).description('是否在首次使用功能前向用户展示测试阶段警示'),
+    version: Schema.string().default('2.0.0').description('测试提示版本号，变更后所有用户需重新确认'),
+  }).description('测试阶段警示').default({
+    enabled: true,
+    version: '2.0.0',
+  }),
 }).description(
   '【公共 API】申请 https://api.awmc.team',
 )
@@ -1346,6 +1364,25 @@ async function getBindingBySession(ctx: Context, session: Session): Promise<User
   return null
 }
 
+async function getOrCreateBindingByUserKey(ctx: Context, userId: string): Promise<UserBinding> {
+  const rows = await ctx.database.get('maibot_bindings', { userId })
+  if (rows.length) return rows[0]
+  await ctx.database.create('maibot_bindings', {
+    userId,
+    qrCode: '',
+    maiUid: '',
+    bindTime: new Date(),
+  })
+  const created = await ctx.database.get('maibot_bindings', { userId })
+  return created[0]
+}
+
+function shouldVerifyBindingIdentity(binding: UserBinding | null, tokenOnlyMode: boolean): boolean {
+  if (!binding) return false
+  if (!tokenOnlyMode) return true
+  return isDxBound(binding)
+}
+
 async function updateBindingBySession(ctx: Context, session: Session, data: Partial<UserBinding>): Promise<boolean> {
   const keys = await getSessionBindingKeys(ctx, session)
   for (const key of keys) {
@@ -1478,6 +1515,9 @@ function createBotMessageTracker(session: Session, ctx: Context, enabled: boolea
       await recallBotMessages(session, ctx, [...ids])
       ids.length = 0
     },
+    messageIds(): string[] {
+      return [...ids]
+    },
   }
 }
 
@@ -1586,19 +1626,24 @@ async function getQrText(
     if (cacheAge < cacheValidDuration && binding.lastQrCode.startsWith('SGWCMAID')) {
       try {
         const previewCached = await api.getPreview(config.machineInfo?.clientId ?? '', binding.lastQrCode)
-        const vr = verifyPreviewMatchesBinding(binding, previewCached)
-        const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
-        if (!hv.blocked) {
-          if (hv.migrationNotice) await session.send(hv.migrationNotice)
-          if (previewCached.UserName != null && !binding.boundPlayerName?.trim()) {
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
-              boundPlayerName: String(previewCached.UserName).trim(),
-            })
+        if (shouldVerifyBindingIdentity(binding, config.tokenOnlyMode === true)) {
+          const vr = verifyPreviewMatchesBinding(binding, previewCached)
+          const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
+          if (!hv.blocked) {
+            if (hv.migrationNotice) await session.send(hv.migrationNotice)
+            if (previewCached.UserName != null && !binding.boundPlayerName?.trim()) {
+              await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
+                boundPlayerName: String(previewCached.UserName).trim(),
+              })
+            }
+            logger.info(`使用缓存的SGID（${Math.floor(cacheAge / 1000)}秒前输入）`)
+            return { qrText: binding.lastQrCode, fromCache: true }
           }
+          logger.info('缓存 SGID 与绑定身份校验失败，需重新输入')
+        } else {
           logger.info(`使用缓存的SGID（${Math.floor(cacheAge / 1000)}秒前输入）`)
           return { qrText: binding.lastQrCode, fromCache: true }
         }
-        logger.info('缓存 SGID 与绑定身份校验失败，需重新输入')
       } catch (e) {
         logger.warn('缓存 SGID 预检失败:', e)
       }
@@ -1711,17 +1756,21 @@ async function getQrText(
         return { qrText: '', error: '无效或过期的二维码' }
       }
       if (binding) {
-        const vr = verifyPreviewMatchesBinding(binding, preview)
-        const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
-        if (hv.blocked) {
-          await processingTracker.recall()
-          return { qrText: '', error: hv.message }
+        if (shouldVerifyBindingIdentity(binding, config.tokenOnlyMode === true)) {
+          const vr = verifyPreviewMatchesBinding(binding, preview)
+          const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
+          if (hv.blocked) {
+            await processingTracker.recall()
+            return { qrText: '', error: hv.message }
+          }
+          if (hv.migrationNotice && !recallInteractive) await session.send(hv.migrationNotice)
         }
-        if (hv.migrationNotice && !recallInteractive) await session.send(hv.migrationNotice)
         const patch: Record<string, unknown> = {
-          qrCode: qrText,
           lastQrCode: qrText,
           lastQrCodeTime: new Date(),
+        }
+        if (config.tokenOnlyMode !== true) {
+          patch.qrCode = qrText
         }
         if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
           patch.boundPlayerName = String(preview.UserName).trim()
@@ -2361,6 +2410,22 @@ export function apply(ctx: Context, config: Config) {
     version: '2.0.0',
   }
   const autoRecallInteractive = config.autoRecallInteractiveMessages !== false
+  const tokenOnlyModeEnabled = config.tokenOnlyMode === true
+  const TOKEN_ONLY_MODE_BLOCKED_MSG =
+    '⚠️ 当前为 Token 直连模式，仅支持：\n' +
+    '· /mai绑定水鱼 /mai解绑水鱼\n' +
+    '· /mai绑定落雪 /mai解绑落雪\n' +
+    '· /mai上传B50 /mai上传落雪b50 /maiua\n' +
+    '· /mai发票'
+  const DX_BIND_REQUIRED_MSG =
+    '❌ 请先完成舞萌DX账号绑定（/mai绑定）。您的水鱼/落雪 Token 已保留。'
+  const BETA_VERSION_NOTICE =
+    '⚠️ 本机器人目前处于测试阶段，部分功能不代表最终效果，可能存在变动或异常。'
+  const betaNoticeConfig = config.betaNotice ?? { enabled: true, version: '2.0.0' }
+  const betaNoticeEnabled = betaNoticeConfig.enabled !== false
+  const BETA_NOTICE_VERSION = betaNoticeConfig.version || '2.0.0'
+  const TOKEN_ONLY_BIND_HINT =
+    '❌ 请先绑定水鱼或落雪 Token\n使用 /mai绑定水鱼 或 /mai绑定落雪'
   const authLevelForProxy = config.authLevelForProxy ?? 3
   const protectionLockMessage = config.protectionLockMessage ?? '🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功'
   const maintenanceMode = config.maintenanceMode ?? false
@@ -2541,6 +2606,34 @@ export function apply(ctx: Context, config: Config) {
     await ctx.database.remove('maibot_user_terms', { userId })
   }
 
+  async function hasAcknowledgedBeta(userId: string): Promise<boolean> {
+    if (!betaNoticeEnabled) return true
+    if (!userId) return false
+    const rows = await ctx.database.get('maibot_user_terms', { userId })
+    if (rows.length === 0) return false
+    return rows[0].betaNoticeVersion === BETA_NOTICE_VERSION
+  }
+
+  async function saveBetaAcknowledged(userId: string): Promise<void> {
+    const existing = await ctx.database.get('maibot_user_terms', { userId })
+    if (existing.length === 0) {
+      await ctx.database.create('maibot_user_terms', {
+        userId,
+        acceptedAt: new Date(),
+        betaNoticeVersion: BETA_NOTICE_VERSION,
+      })
+    } else {
+      await ctx.database.set('maibot_user_terms', { userId }, {
+        betaNoticeVersion: BETA_NOTICE_VERSION,
+      })
+    }
+  }
+
+  function prependBetaNotice(text: string): string {
+    if (!betaNoticeEnabled) return text
+    return `${BETA_VERSION_NOTICE}\n\n${text}`
+  }
+
   /** V2 数据迁移中间件：老用户需确认迁移，拒绝则无法继续使用 */
   ctx.middleware(async (session, next) => {
     const content = session.content?.trim() || ''
@@ -2580,28 +2673,36 @@ export function apply(ctx: Context, config: Config) {
     const tracker = createBotMessageTracker(session, ctx, autoRecallInteractive)
     await tracker.send(V2_MIGRATION_PROMPT)
 
+    const replySession = await waitForUserReply(session, ctx, 60000, tracker.messageIds())
+    await tracker.recall()
+    const reply = replySession?.content?.trim() || ''
+    if (!reply) {
+      return '❌ 迁移确认超时，操作已取消'
+    }
+    const decision = parseMigrationConfirm(reply)
+    if (decision === 'no') {
+      return '❌ 您已取消数据迁移，无法继续使用 maiBot V2。如需使用请重新发起指令并选择【是】。'
+    }
+    if (decision !== 'yes') {
+      return '❌ 请输入【是】或【否】以确认是否迁移数据'
+    }
+
+    await tracker.send(V2_MIGRATION_CONFIRM_PROMPT)
+    const confirmSession = await waitForUserReply(session, ctx, 60000, tracker.messageIds())
+    await tracker.recall()
+    const confirmReply = confirmSession?.content?.trim() || ''
+    if (!confirmReply) {
+      return '❌ 迁移确认超时，操作已取消'
+    }
+    const confirmDecision = parseMigrationConfirm(confirmReply)
+    if (confirmDecision === 'no') {
+      return '❌ 您已取消数据迁移，无法继续使用 maiBot V2。如需使用请重新发起指令并选择【是】。'
+    }
+    if (confirmDecision !== 'yes') {
+      return '❌ 请输入【是】或【否】以确认是否同意变更并完成迁移'
+    }
+
     try {
-      const reply = await session.prompt(60000)
-      await tracker.recall()
-      const decision = parseMigrationConfirm(reply)
-      if (decision === 'no') {
-        return '❌ 您已取消数据迁移，无法继续使用 maiBot V2。如需使用请重新发起指令并选择【是】。'
-      }
-      if (decision !== 'yes') {
-        return '❌ 请输入【是】或【否】以确认是否迁移数据'
-      }
-
-      await tracker.send(V2_MIGRATION_CONFIRM_PROMPT)
-      const confirmReply = await session.prompt(60000)
-      await tracker.recall()
-      const confirmDecision = parseMigrationConfirm(confirmReply)
-      if (confirmDecision === 'no') {
-        return '❌ 您已取消数据迁移，无法继续使用 maiBot V2。如需使用请重新发起指令并选择【是】。'
-      }
-      if (confirmDecision !== 'yes') {
-        return '❌ 请输入【是】或【否】以确认是否同意变更并完成迁移'
-      }
-
       if (isV2UserIdFormat(migrationTargetId)) {
         await performV2UserMigration(ctx, migrationTargetId, keys)
       } else {
@@ -2609,11 +2710,11 @@ export function apply(ctx: Context, config: Config) {
         await clearLegacyLxnsBinding(ctx, migrationTargetId)
         await markV2MigrationComplete(ctx, migrationTargetId)
       }
-      return '✅ 数据已迁移至 maiBot V2。落雪好友码绑定已清除，请使用落雪 Token 重新绑定。请重新确认用户协议后再使用其他功能。'
-    } catch {
-      await tracker.recall()
-      return '❌ 迁移确认超时，操作已取消'
+    } catch (error) {
+      logger.warn('V2 数据迁移执行失败:', error)
+      return '❌ 数据迁移失败，请稍后重试或联系管理员'
     }
+    return '✅ 数据已迁移至 maiBot V2。落雪好友码绑定已清除，请使用落雪 Token 重新绑定。请重新确认用户协议后再使用其他功能。'
   }, true)
 
   /** public 模式：接口暂未开放，仅允许帮助/卡密/管理员等本地指令 */
@@ -2636,6 +2737,82 @@ export function apply(ctx: Context, config: Config) {
       return next()
     }
     return PUBLIC_API_UNAVAILABLE_MSG
+  }, true)
+
+  /** Token 直连模式：仅允许 B50 / 发票 / Token 绑定相关指令 */
+  ctx.middleware(async (session, next) => {
+    if (!tokenOnlyModeEnabled) return next()
+    const content = session.content?.trim() || ''
+    if (!content.match(/^\/?mai/i)) return next()
+    if (isDebugSession(session)) return next()
+
+    const baseCmd = (content.replace(/^\//, '').split(/\s+/)[0] || '').toLowerCase()
+    if (
+      baseCmd === 'mai'
+      || baseCmd === 'mai帮助'
+      || baseCmd === 'mai绑定水鱼'
+      || baseCmd === 'mai解绑水鱼'
+      || baseCmd === 'mai绑定落雪'
+      || baseCmd === 'mai解绑落雪'
+      || baseCmd === 'mai上传b50'
+      || baseCmd === 'maiua'
+      || baseCmd === 'mai上传落雪b50'
+      || baseCmd === 'mai发票'
+      || baseCmd.startsWith('mai管理员')
+      || baseCmd === 'maibypass'
+    ) {
+      return next()
+    }
+    return TOKEN_ONLY_MODE_BLOCKED_MSG
+  }, true)
+
+  // 测试阶段警示：协议确认后、首次使用功能前须确认
+  ctx.middleware(async (session, next) => {
+    if (!betaNoticeEnabled) {
+      return next()
+    }
+
+    const content = session.content?.trim() || ''
+    if (!content.match(/^\/?mai/i)) {
+      return next()
+    }
+
+    if (isDebugSession(session)) {
+      return next()
+    }
+
+    const baseCmd = content.replace(/^\//, '').split(/\s+/)[0] || ''
+    const betaExempt = new Set(['mai', 'mai帮助', 'maiping', 'maiqueue', 'maialert', 'mai兑换卡密', 'maiSGID获取', 'SGID获取'])
+    if (betaExempt.has(baseCmd) || baseCmd.startsWith('maialert') || baseCmd.startsWith('mai管理员') || baseCmd === 'maibypass') {
+      return next()
+    }
+
+    const canonicalUserId = await getCanonicalV2UserId(session)
+    const keys = await getSessionBindingKeys(ctx, session)
+    const primaryUserId = canonicalUserId || keys[0] || String(session.userId || '')
+    if (!primaryUserId) {
+      return next()
+    }
+
+    if (!(await hasCompletedV2Migration(ctx, primaryUserId))) {
+      return next()
+    }
+
+    if (await hasAcknowledgedBeta(primaryUserId)) {
+      return next()
+    }
+
+    const accepted = await promptYesLocal(
+      session,
+      `${BETA_VERSION_NOTICE}\n\n请确认您已知晓上述说明。`,
+      60000,
+    )
+    if (!accepted) {
+      return '❌ 未确认测试阶段提示，操作已取消'
+    }
+
+    await saveBetaAcknowledged(primaryUserId)
+    return next()
   }, true)
 
   // 用户协议中间件：拦截 mai 指令，要求用户浏览协议页并输入确认词
@@ -2679,19 +2856,17 @@ export function apply(ctx: Context, config: Config) {
       '请仔细阅读。',
     )
 
-    try {
-      const reply = await session.prompt(60000)
-      await tracker.recall()
-      const replyText = (reply || '').trim()
-      if (replyText === TERMS_ACCEPT_TEXT) {
-        await saveTermsAccepted(primaryUserId)
-        return next()
-      }
-      return '❌ 未输入正确的提示词，操作已取消'
-    } catch {
-      await tracker.recall()
+    const replySession = await waitForUserReply(session, ctx, 60000, tracker.messageIds())
+    await tracker.recall()
+    const replyText = (replySession?.content || '').trim()
+    if (!replyText) {
       return '❌ 确认超时，操作已取消'
     }
+    if (replyText === TERMS_ACCEPT_TEXT) {
+      await saveTermsAccepted(primaryUserId)
+      return next()
+    }
+    return '❌ 未输入正确的提示词，操作已取消'
   }, true)
 
   /**
@@ -2784,10 +2959,22 @@ export function apply(ctx: Context, config: Config) {
     // 如果没有提供目标用户，使用当前用户
     if (!targetUserIdRaw) {
       logger.debug(`getTargetBinding: 未提供目标用户，使用当前用户 ${currentUserId}`)
-      const binding = await getBindingBySession(ctx, session)
+      let binding = await getBindingBySession(ctx, session)
+      if (!binding && tokenOnlyModeEnabled) {
+        const keys = await getSessionBindingKeys(ctx, session)
+        const key = await getCanonicalV2UserId(session) || keys[0] || String(session.userId || '')
+        if (key) binding = await getOrCreateBindingByUserKey(ctx, key)
+      }
       logger.debug(`getTargetBinding: 当前用户绑定状态 = ${binding ? 'found' : 'not found'}`)
       if (!binding) {
-        return { binding: null, isProxy: false, error: '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定' }
+        return {
+          binding: null,
+          isProxy: false,
+          error: tokenOnlyModeEnabled ? TOKEN_ONLY_BIND_HINT : '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定',
+        }
+      }
+      if (!tokenOnlyModeEnabled && !isDxBound(binding)) {
+        return { binding: null, isProxy: false, error: DX_BIND_REQUIRED_MSG }
       }
       return { binding, isProxy: false, error: null }
     }
@@ -2839,12 +3026,54 @@ export function apply(ctx: Context, config: Config) {
     }
     logger.debug(`getTargetBinding: 候选键 = ${[...candidates].join(', ')}, 命中数量 = ${bindings.length}`)
     if (bindings.length === 0) {
+      if (tokenOnlyModeEnabled) {
+        const key = [...candidates][0]
+        const binding = await getOrCreateBindingByUserKey(ctx, key)
+        return { binding, isProxy: true, error: null }
+      }
       logger.warn(`getTargetBinding: 用户 ${targetUserIdRaw} 尚未绑定账号（原始输入: "${targetUserIdText}"）`)
       return { binding: null, isProxy: true, error: `❌ 用户 ${targetUserIdRaw} 尚未绑定账号\n\n[Debug] 原始输入: "${targetUserIdText}"\n提取的ID: "${targetUserIdRaw}"\n候选键: ${[...candidates].join(', ')}\n请确认用户ID是否正确` }
     }
-    
+
+    const binding = bindings[0]
+    if (!tokenOnlyModeEnabled && !isDxBound(binding)) {
+      return { binding: null, isProxy: true, error: DX_BIND_REQUIRED_MSG }
+    }
+
     logger.debug(`getTargetBinding: 成功获取目标用户 ${targetUserIdRaw} 的绑定`)
-    return { binding: bindings[0], isProxy: true, error: null }
+    return { binding, isProxy: true, error: null }
+  }
+
+  async function verifyQrPreviewIfNeeded(
+    binding: UserBinding,
+    preview: { UserID: string | number; UserName?: string },
+    session: Session,
+  ): Promise<{ blocked: true; message: string } | { blocked: false; migrationNotice?: string }> {
+    if (!shouldVerifyBindingIdentity(binding, tokenOnlyModeEnabled)) {
+      return { blocked: false }
+    }
+    const vr = verifyPreviewMatchesBinding(binding, preview)
+    const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
+    if (hv.blocked) return { blocked: true, message: hv.message }
+    return { blocked: false, migrationNotice: hv.migrationNotice }
+  }
+
+  function patchQrCacheFromPreview(
+    binding: UserBinding,
+    qrCode: string,
+    preview: { UserName?: string },
+  ): Record<string, unknown> {
+    const patch: Record<string, unknown> = {
+      lastQrCode: qrCode,
+      lastQrCodeTime: new Date(),
+    }
+    if (!tokenOnlyModeEnabled) {
+      patch.qrCode = qrCode
+    }
+    if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
+      patch.boundPlayerName = String(preview.UserName).trim()
+    }
+    return patch
   }
 
   async function recallBotMessages(session: Session, messageIds: string[] | undefined): Promise<void> {
@@ -3163,7 +3392,34 @@ export function apply(ctx: Context, config: Config) {
       const userAuthority = (session.user as any)?.authority ?? 0
       const canProxy = userAuthority >= authLevelForProxy
 
-      let helpText = `📖 舞萌DX机器人指令帮助${isPublicApi ? '（公共 API 模式）' : ''}
+      if (tokenOnlyModeEnabled) {
+        let tokenHelp = `📖 舞萌DX机器人指令帮助（Token 直连模式）
+
+ℹ️ 当前无需 /mai绑定，请按 userId 直接绑定 Token，且仅可使用以下指令：
+
+🐟 水鱼：
+  /mai绑定水鱼 <token> - 绑定水鱼Token
+  /mai解绑水鱼 - 解绑水鱼Token
+  /mai上传B50 - 上传B50到水鱼
+
+❄️ 落雪：
+  /mai绑定落雪 <token> - 绑定落雪Token
+  /mai解绑落雪 - 解绑落雪Token
+  /mai上传落雪b50 - 上传B50到落雪
+
+  /maiua - 同时上传B50到水鱼和落雪
+
+🎫 票券：
+  /mai发票 [倍数] - 发放功能票（2-6倍）
+
+关闭 Token 直连模式后，未完成舞萌绑定的用户须使用 /mai绑定。`
+        if (canProxy) {
+          tokenHelp += `\n\n代操作（auth>=${authLevelForProxy}）可在指令后加 [@用户]`
+        }
+        return prependBetaNotice(tokenHelp)
+      }
+
+      let helpText = prependBetaNotice(`📖 舞萌DX机器人指令帮助${isPublicApi ? '（公共 API 模式）' : ''}
 
 🔐 账号管理：
   /mai绑定 - 绑定舞萌DX账号（支持SGID文本或公众号提供的网页地址）
@@ -3171,7 +3427,7 @@ export function apply(ctx: Context, config: Config) {
   /mai状态 - 查询绑定状态
   /mymai - 与 /mai状态 相同（别名）
   /maiping - 测试机台连接
-  /maiqueue - 查询发票充值队列状态`
+  /maiqueue - 查询发票充值队列状态`)
 
       // 有权限的代操作命令
       if (canProxy) {
@@ -3468,6 +3724,10 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
+      if (tokenOnlyModeEnabled) {
+        return '⚠️ 当前为 Token 直连模式，舞萌账号绑定已关闭。\n请使用 /mai绑定水鱼 或 /mai绑定落雪 绑定 Token。'
+      }
+
       // 使用队列系统
       const userBindingKeys = await getSessionBindingKeys(ctx, session)
       const userId = await getCanonicalV2UserId(session) || userBindingKeys[0] || String(session.userId)
@@ -3475,7 +3735,7 @@ export function apply(ctx: Context, config: Config) {
       try {
         // 检查是否已绑定
         const existing = await getBindingBySession(ctx, session)
-        if (existing) {
+        if (existing && isDxBound(existing)) {
           return await formatAlreadyBoundMessage(existing)
         }
 
@@ -3667,18 +3927,25 @@ export function apply(ctx: Context, config: Config) {
           )
         }
 
-        // 存储到数据库
-        await ctx.database.create('maibot_bindings', {
-          userId,
+        const bindPayload = {
           maiUid,
           qrCode,
           bindTime: new Date(),
           userName,
           boundPlayerName: userName != null ? String(userName).trim() : undefined,
           rating,
-          lastQrCode: qrCode,  // 保存为缓存
-          lastQrCodeTime: new Date(),  // 保存时间戳
-        })
+          lastQrCode: qrCode,
+          lastQrCodeTime: new Date(),
+        }
+
+        if (existing && !isDxBound(existing)) {
+          await ctx.database.set('maibot_bindings', { userId: existing.userId }, bindPayload)
+        } else {
+          await ctx.database.create('maibot_bindings', {
+            userId,
+            ...bindPayload,
+          })
+        }
         await touchRebindClock(userId)
 
         const successMessage = `✅ 绑定成功！\n` +
@@ -3731,10 +3998,18 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
+      if (tokenOnlyModeEnabled) {
+        return '⚠️ 当前为 Token 直连模式，舞萌账号解绑已关闭。'
+      }
+
       try {
         const binding = await getBindingBySession(ctx, session)
         if (!binding) {
           return '❌ 您还没有绑定账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        if (!isDxBound(binding)) {
+          return '❌ 您尚未完成舞萌DX账号绑定\n使用 /mai绑定 进行绑定'
         }
 
         const waitMs = await getRebindWaitMsForBinding(binding)
@@ -3769,10 +4044,16 @@ export function apply(ctx: Context, config: Config) {
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
+      if (tokenOnlyModeEnabled) {
+        return '⚠️ 当前为 Token 直连模式，舞萌账号解绑已关闭。'
+      }
       try {
         const binding = await getBindingBySession(ctx, session)
         if (!binding) {
           return '❌ 您还没有绑定账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+        if (!isDxBound(binding)) {
+          return '❌ 您尚未完成舞萌DX账号绑定\n使用 /mai绑定 进行绑定'
         }
         const waitMs = await getRebindWaitMsForBinding(binding)
         const credits = binding.unbindCredits ?? 0
@@ -4861,20 +5142,12 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            const vr = verifyPreviewMatchesBinding(binding, preview)
-            const hv = await applyVerifyPreviewBinding(ctx, binding, vr, ctx.logger('maibot'))
-            if (hv.blocked) {
-              return hv.message
+            const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
+            if (vc.blocked) {
+              return vc.message
             }
-            if (hv.migrationNotice) await session.send(hv.migrationNotice)
-            const patch: Record<string, unknown> = {
-              lastQrCode: qrCode,
-              lastQrCodeTime: new Date(),
-            }
-            if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
-              patch.boundPlayerName = String(preview.UserName).trim()
-            }
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
+            if (vc.migrationNotice) await session.send(vc.migrationNotice)
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patchQrCacheFromPreview(binding, qrCode, preview))
             qrTextResult = { qrText: qrCode }
           } catch (error: any) {
             return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
@@ -5071,20 +5344,12 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            const vr = verifyPreviewMatchesBinding(binding, preview)
-            const hv = await applyVerifyPreviewBinding(ctx, binding, vr, ctx.logger('maibot'))
-            if (hv.blocked) {
-              return hv.message
+            const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
+            if (vc.blocked) {
+              return vc.message
             }
-            if (hv.migrationNotice) await session.send(hv.migrationNotice)
-            const patch: Record<string, unknown> = {
-              lastQrCode: qrCode,
-              lastQrCodeTime: new Date(),
-            }
-            if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
-              patch.boundPlayerName = String(preview.UserName).trim()
-            }
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
+            if (vc.migrationNotice) await session.send(vc.migrationNotice)
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patchQrCacheFromPreview(binding, qrCode, preview))
             qrTextResult = { qrText: qrCode }
           } catch (error: any) {
             return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
@@ -5578,20 +5843,12 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            const vr = verifyPreviewMatchesBinding(binding, preview)
-            const hv = await applyVerifyPreviewBinding(ctx, binding, vr, ctx.logger('maibot'))
-            if (hv.blocked) {
-              return hv.message
+            const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
+            if (vc.blocked) {
+              return vc.message
             }
-            if (hv.migrationNotice) await session.send(hv.migrationNotice)
-            const patch: Record<string, unknown> = {
-              lastQrCode: qrCode,
-              lastQrCodeTime: new Date(),
-            }
-            if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
-              patch.boundPlayerName = String(preview.UserName).trim()
-            }
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
+            if (vc.migrationNotice) await session.send(vc.migrationNotice)
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patchQrCacheFromPreview(binding, qrCode, preview))
             qrTextResult = { qrText: qrCode }
           } catch (error: any) {
             return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
@@ -5813,20 +6070,12 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            const vr = verifyPreviewMatchesBinding(binding, preview)
-            const hv = await applyVerifyPreviewBinding(ctx, binding, vr, ctx.logger('maibot'))
-            if (hv.blocked) {
-              return hv.message
+            const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
+            if (vc.blocked) {
+              return vc.message
             }
-            if (hv.migrationNotice) await session.send(hv.migrationNotice)
-            const patch: Record<string, unknown> = {
-              lastQrCode: qrCode,
-              lastQrCodeTime: new Date(),
-            }
-            if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
-              patch.boundPlayerName = String(preview.UserName).trim()
-            }
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
+            if (vc.migrationNotice) await session.send(vc.migrationNotice)
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patchQrCacheFromPreview(binding, qrCode, preview))
             qrTextResult = { qrText: qrCode }
           } catch (err: any) {
             return `❌ 验证二维码失败：${getSafeErrorMessage(err, session)}`
@@ -6329,20 +6578,12 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            const vr = verifyPreviewMatchesBinding(binding, preview)
-            const hv = await applyVerifyPreviewBinding(ctx, binding, vr, ctx.logger('maibot'))
-            if (hv.blocked) {
-              return hv.message
+            const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
+            if (vc.blocked) {
+              return vc.message
             }
-            if (hv.migrationNotice) await session.send(hv.migrationNotice)
-            const patch: Record<string, unknown> = {
-              lastQrCode: qrCode,
-              lastQrCodeTime: new Date(),
-            }
-            if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
-              patch.boundPlayerName = String(preview.UserName).trim()
-            }
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
+            if (vc.migrationNotice) await session.send(vc.migrationNotice)
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patchQrCacheFromPreview(binding, qrCode, preview))
             qrTextResult = { qrText: qrCode }
           } catch (error: any) {
             return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`

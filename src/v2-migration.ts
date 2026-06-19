@@ -44,7 +44,7 @@ export const V2_MIGRATION_CONFIRM_PROMPT =
 
 export function parseMigrationConfirm(input: string | undefined | null): 'yes' | 'no' | null {
   const t = (input ?? '').trim().toLowerCase()
-  if (['是', 'y', 'yes', '确认', '好', 'ok'].includes(t)) return 'yes'
+  if (['是', 'y', 'yes', '确认', '好', 'ok', '同意', '是的', '好的'].includes(t)) return 'yes'
   if (['否', 'n', 'no', '取消', '不'].includes(t)) return 'no'
   return null
 }
