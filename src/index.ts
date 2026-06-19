@@ -422,6 +422,29 @@ const MAI_TRIGGER_USER_ID = '__maiTriggerUserId'
 const MAI_TRIGGER_MESSAGE_ID = '__maiTriggerMessageId'
 const MAI_ORIGINAL_SEND = '__maiOriginalSessionSend'
 
+type StrippedSession = Session & { stripped?: { content?: string; prefix?: string } }
+
+/** 去掉 Koishi 指令前缀后的正文（如 .maiu → maiu） */
+function getMaiMessageBody(session: Session): string {
+  const s = session as StrippedSession
+  const raw = (s.stripped?.content ?? session.content ?? '').trim()
+  const prefix = s.stripped?.prefix
+  if (prefix && raw.startsWith(prefix)) {
+    return raw.slice(prefix.length).trimStart()
+  }
+  return raw
+}
+
+/** 是否为 mai 插件相关用户消息（含别名 maiu / maiul 等） */
+function isMaiUserMessage(session: Session): boolean {
+  return /^\/?mai/i.test(getMaiMessageBody(session))
+}
+
+/** 去掉前缀与参数后的 mai 指令名（如 maiu、mai上传B50） */
+function getMaiCommandName(session: Session): string {
+  return getMaiMessageBody(session).replace(/^\//, '').split(/\s+/)[0] || ''
+}
+
 /** 解析可用于 @ 的平台用户 ID（优先纯数字 QQ 号） */
 function resolveAtUserId(session: Session): string | null {
   const bag = session as unknown as Record<string, unknown>
@@ -441,7 +464,7 @@ function resolveAtUserId(session: Session): string | null {
   return null
 }
 
-function getTriggerMessageId(session: Session): string | undefined {
+function resolveTriggerMessageId(session: Session): string | undefined {
   const bag = session as unknown as Record<string, unknown>
   const stored = bag[MAI_TRIGGER_MESSAGE_ID]
   if (stored !== undefined && stored !== null && stored !== '') {
@@ -451,6 +474,12 @@ function getTriggerMessageId(session: Session): string | undefined {
   if (mid !== undefined && mid !== null && mid !== '') {
     return String(mid)
   }
+  const event = (session as { event?: { message?: { id?: unknown }; messageId?: unknown } }).event
+  for (const raw of [event?.message?.id, event?.messageId]) {
+    if (raw !== undefined && raw !== null && raw !== '') {
+      return String(raw)
+    }
+  }
   return undefined
 }
 
@@ -458,10 +487,20 @@ function stashTriggerSessionMeta(session: Session): void {
   const bag = session as unknown as Record<string, unknown>
   const atId = resolveAtUserId(session)
   if (atId) bag[MAI_TRIGGER_USER_ID] = atId
-  const mid = session.messageId
-  if (mid !== undefined && mid !== null && mid !== '') {
-    bag[MAI_TRIGGER_MESSAGE_ID] = String(mid)
+  const mid = resolveTriggerMessageId(session)
+  if (mid) bag[MAI_TRIGGER_MESSAGE_ID] = mid
+}
+
+function fragmentAlreadyQuoted(content: unknown): boolean {
+  const visit = (node: unknown): boolean => {
+    if (!node || typeof node !== 'object') return false
+    if ((node as { type?: string }).type === 'quote') return true
+    if (Array.isArray(node)) return node.some(visit)
+    const children = (node as { children?: unknown[] }).children
+    if (Array.isArray(children)) return children.some(visit)
+    return false
   }
+  return visit(content)
 }
 
 /** 群聊回复：暂存触发消息元数据并包装 session.send */
@@ -482,9 +521,10 @@ function stripLegacyAtTags(text: string): string {
 
 function wrapForGroupReply(session: Session, content: unknown): Fragment {
   if (content == null) return ''
+  if (fragmentAlreadyQuoted(content)) return content as Fragment
 
   const atId = resolveAtUserId(session)
-  const messageId = getTriggerMessageId(session)
+  const messageId = resolveTriggerMessageId(session)
   const parts: unknown[] = []
 
   if (messageId) parts.push(h.quote(String(messageId)))
@@ -516,15 +556,6 @@ function patchSessionSendForGroupReply(session: Session): void {
   bag[MAI_ORIGINAL_SEND] = originalSend
   session.send = async (content: unknown) => {
     return originalSend(wrapForGroupReply(session, content))
-  }
-}
-
-function restoreSessionSend(session: Session): void {
-  const bag = session as unknown as Record<string, unknown>
-  const originalSend = bag[MAI_ORIGINAL_SEND]
-  if (typeof originalSend === 'function') {
-    session.send = originalSend as Session['send']
-    delete bag[MAI_ORIGINAL_SEND]
   }
 }
 
@@ -2790,9 +2821,7 @@ export function apply(ctx: Context, config: Config) {
     }
     
     // 检查是否是 maibot 插件的命令（所有 mai 开头的命令，包括 maialert）
-    const content = session.content?.trim() || ''
-    // 匹配所有 mai 开头的命令：/mai、mai、/maialert、maialert 等
-    if (content.match(/^\/?mai/i)) {
+    if (isMaiUserMessage(session)) {
       return maintenanceMessage
     }
     
@@ -2862,8 +2891,7 @@ export function apply(ctx: Context, config: Config) {
 
   /** V2 数据迁移中间件：老用户需确认迁移，拒绝则无法继续使用 */
   ctx.middleware(async (session, next) => {
-    const content = session.content?.trim() || ''
-    if (!content.match(/^\/?mai/i)) {
+    if (!isMaiUserMessage(session)) {
       return next()
     }
 
@@ -2871,7 +2899,7 @@ export function apply(ctx: Context, config: Config) {
       return next()
     }
 
-    const baseCmd = content.replace(/^\//, '').split(/\s+/)[0] || ''
+    const baseCmd = getMaiCommandName(session)
     if (baseCmd === 'mai' || baseCmd === 'mai帮助' || baseCmd === 'maiping' || baseCmd === 'maiSGID获取' || baseCmd === 'SGID获取') {
       return next()
     }
@@ -2946,11 +2974,10 @@ export function apply(ctx: Context, config: Config) {
   /** public 模式：接口暂未开放，仅允许帮助/卡密/管理员等本地指令 */
   ctx.middleware(async (session, next) => {
     if (!isPublicApi) return next()
-    const content = session.content?.trim() || ''
-    if (!content.match(/^\/?mai/i)) return next()
+    if (!isMaiUserMessage(session)) return next()
     if (isDebugSession(session)) return next()
 
-    const baseCmd = content.replace(/^\//, '').split(/\s+/)[0] || ''
+    const baseCmd = getMaiCommandName(session)
     const publicApiExempt = new Set([
       'mai', 'mai帮助', 'maialert', 'mai兑换卡密', 'maiSGID获取', 'SGID获取',
     ])
@@ -2984,8 +3011,7 @@ export function apply(ctx: Context, config: Config) {
       return next()
     }
 
-    const content = session.content?.trim() || ''
-    if (!content.match(/^\/?mai/i)) {
+    if (!isMaiUserMessage(session)) {
       return next()
     }
 
@@ -2993,7 +3019,7 @@ export function apply(ctx: Context, config: Config) {
       return next()
     }
 
-    const baseCmd = content.replace(/^\//, '').split(/\s+/)[0] || ''
+    const baseCmd = getMaiCommandName(session)
     const betaExempt = new Set(['mai', 'mai帮助', 'maiping', 'maiqueue', 'maialert', 'mai兑换卡密', 'maiSGID获取', 'SGID获取'])
     if (betaExempt.has(baseCmd) || baseCmd.startsWith('maialert') || baseCmd.startsWith('mai管理员') || baseCmd === 'maibypass') {
       return next()
@@ -3029,8 +3055,7 @@ export function apply(ctx: Context, config: Config) {
 
   // 用户协议中间件：拦截 mai 指令，要求用户浏览协议页并输入确认词
   ctx.middleware(async (session, next) => {
-    const content = session.content?.trim() || ''
-    if (!content.match(/^\/?mai/i)) {
+    if (!isMaiUserMessage(session)) {
       return next()
     }
 
@@ -3038,7 +3063,7 @@ export function apply(ctx: Context, config: Config) {
       return next()
     }
 
-    const baseCmd = content.replace(/^\//, '').split(/\s+/)[0] || ''
+    const baseCmd = getMaiCommandName(session)
     const termsExempt = new Set(['mai', 'mai帮助', 'maiping', 'maiqueue', 'maialert', 'mai兑换卡密', 'maiSGID获取', 'SGID获取'])
     if (termsExempt.has(baseCmd) || baseCmd.startsWith('maialert') || baseCmd.startsWith('mai管理员') || baseCmd === 'maibypass') {
       return next()
@@ -3081,20 +3106,18 @@ export function apply(ctx: Context, config: Config) {
     return '❌ 未输入正确的提示词，操作已取消'
   }, true)
 
-  /** 群聊：mai 指令文本回复引用原消息并 @ 发送者 */
+  /**
+   * 群聊：mai 指令回复引用原消息并 @ 发送者。
+   * 通过包装 session.send 生效（含 Koishi 在 middleware 结束后发送的命令返回值），
+   * 不在 finally 中 restore，避免最终 session.send(result) 时包装已失效。
+   */
   ctx.middleware(async (session, next) => {
-    const content = session.content?.trim() || ''
-    if (!content.match(/^\/?mai/i)) return next()
+    if (!isMaiUserMessage(session)) return next()
     prepareGroupReplySession(session, replyInGroupEnabled)
     enableGuildReplyOnSession(session, replyInGroupEnabled)
     try {
-      const result = await next()
-      if (typeof result === 'string' && result && shouldUseGroupReply(session, replyInGroupEnabled)) {
-        return wrapForGroupReply(session, result)
-      }
-      return result
+      return await next()
     } finally {
-      restoreSessionSend(session)
       disableGuildReplyOnSession(session)
     }
   }, true)
