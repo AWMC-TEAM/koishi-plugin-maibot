@@ -420,6 +420,7 @@ const MAI_SESSION_CMD_USAGE_KEY = '__maiCmdUsageHint'
 const MAI_GUILD_REPLY_KEY = '__maiGuildReplyEnabled'
 const MAI_TRIGGER_USER_ID = '__maiTriggerUserId'
 const MAI_TRIGGER_MESSAGE_ID = '__maiTriggerMessageId'
+const MAI_ORIGINAL_SEND = '__maiOriginalSessionSend'
 
 type StrippedSession = Session & { stripped?: { content?: string; prefix?: string } }
 
@@ -521,41 +522,11 @@ function fragmentAlreadyQuoted(content: unknown): boolean {
   return visit(content)
 }
 
-function fragmentAlreadyHasAt(content: unknown, atId: string): boolean {
-  const visit = (node: unknown): boolean => {
-    if (!node || typeof node !== 'object') return false
-    const el = node as { type?: string; attrs?: { id?: unknown } }
-    if (el.type === 'at' && String(el.attrs?.id ?? '') === atId) return true
-    if (Array.isArray(node)) return node.some(visit)
-    const children = (node as { children?: unknown[] }).children
-    if (Array.isArray(children)) return children.some(visit)
-    return false
-  }
-  return visit(content)
-}
-
-function prependGroupReplyElements(source: Session, target: { elements?: unknown[] }): void {
-  const elements = target.elements
-  if (!elements?.length) return
-
-  const atId = resolveAtUserId(source)
-  const messageId = resolveTriggerMessageId(source)
-  const prefix: unknown[] = []
-
-  if (messageId && !fragmentAlreadyQuoted(elements)) {
-    prefix.push(h.quote(String(messageId)))
-  }
-  if (atId && !fragmentAlreadyHasAt(elements, atId)) {
-    prefix.push(h.at(atId), '\n')
-  }
-  if (prefix.length === 0) return
-  target.elements = [...prefix, ...elements]
-}
-
-/** 群聊回复：暂存触发消息元数据（发送时由 before-send 统一加引用与 @） */
+/** 群聊回复：暂存触发消息元数据并包装 session.send */
 function prepareGroupReplySession(session: Session, replyInGroup: boolean): void {
   if (!shouldUseGroupReply(session, replyInGroup)) return
   stashTriggerSessionMeta(session)
+  patchSessionSendForGroupReply(session)
 }
 
 function shouldUseGroupReply(session: Session, replyInGroup: boolean): boolean {
@@ -576,7 +547,7 @@ function wrapForGroupReply(session: Session, content: unknown): Fragment {
   const parts: unknown[] = []
 
   if (messageId) parts.push(h.quote(String(messageId)))
-  if (atId) parts.push(h.at(atId), '\n')
+  if (atId) parts.push(h.at(atId), h.text('\n'))
 
   if (typeof content === 'string') {
     const body = stripLegacyAtTags(content)
@@ -594,7 +565,21 @@ function wrapForGroupReply(session: Session, content: unknown): Fragment {
   }
 
   if (parts.length === 0) return ''
-  return parts as Fragment
+  return h.normalize(parts as Fragment)
+}
+
+function patchSessionSendForGroupReply(session: Session): void {
+  const bag = session as unknown as Record<string, unknown>
+  if (bag[MAI_ORIGINAL_SEND]) return
+  const originalSend = session.send.bind(session)
+  bag[MAI_ORIGINAL_SEND] = originalSend
+  session.send = async (content: unknown) => {
+    if (!bag[MAI_GUILD_REPLY_KEY]) {
+      return originalSend(content as Fragment)
+    }
+    stashTriggerSessionMeta(session)
+    return originalSend(wrapForGroupReply(session, content) as Fragment)
+  }
 }
 
 function enableGuildReplyOnSession(session: Session, replyInGroup: boolean): void {
@@ -2205,16 +2190,6 @@ export function apply(ctx: Context, config: Config) {
   const chargePollIntervalMs = config.chargePollInterval ?? 3000
   const chargePollTimeoutMs = config.chargePollTimeout ?? 180000
 
-  /** 群聊内所有 Bot 发送（含交互提示、处理中、命令返回值）统一加引用与 @ */
-  ctx.on('before-send', (sendSession: Session, options?: { session?: Session }) => {
-    const source = options?.session
-    if (!source || !shouldUseGroupReply(source, replyInGroupEnabled)) return
-    const bag = source as unknown as Record<string, unknown>
-    if (!bag[MAI_GUILD_REPLY_KEY]) return
-    stashTriggerSessionMeta(source)
-    prependGroupReplyElements(source, sendSession as { elements?: unknown[] })
-  })
-
   // 错误帮助URL配置
   const errorHelpUrl = config.errorHelpUrl || ''
 
@@ -3155,8 +3130,7 @@ export function apply(ctx: Context, config: Config) {
   }, true)
 
   /**
-   * 群聊：mai 指令回复引用原消息并 @ 发送者。
-   * 标记会话后由 before-send 统一包装所有出站消息（含 SGID 提示、B50 结果等）。
+   * 群聊：mai 指令回复引用原消息并 @ 发送者（包装 session.send，含交互提示与命令返回值）。
    */
   ctx.middleware(async (session, next) => {
     if (!isMaiUserMessage(session)) return next()
@@ -3688,11 +3662,10 @@ export function apply(ctx: Context, config: Config) {
     const channelId = session.channelId
     if (!bot || !channelId) return
     const full = refId ? appendRefId(content, refId) : content
-    stashTriggerSessionMeta(session)
-    if (shouldUseGroupReply(session, replyInGroupEnabled)) {
-      enableGuildReplyOnSession(session, true)
-    }
-    await bot.sendMessage(channelId, full, session.guildId, { session })
+    const payload = shouldUseGroupReply(session, replyInGroupEnabled)
+      ? wrapForGroupReply(session, full)
+      : full
+    await bot.sendMessage(channelId, payload, session.guildId)
   }
 
   const scheduleChargeNotification = (
