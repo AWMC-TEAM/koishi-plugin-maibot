@@ -444,15 +444,31 @@ function resolveAtUserId(session: Session): string | null {
 function getTriggerMessageId(session: Session): string | undefined {
   const bag = session as unknown as Record<string, unknown>
   const stored = bag[MAI_TRIGGER_MESSAGE_ID]
-  if (typeof stored === 'string' && stored) return stored
-  return session.messageId
+  if (stored !== undefined && stored !== null && stored !== '') {
+    return String(stored)
+  }
+  const mid = session.messageId
+  if (mid !== undefined && mid !== null && mid !== '') {
+    return String(mid)
+  }
+  return undefined
 }
 
 function stashTriggerSessionMeta(session: Session): void {
   const bag = session as unknown as Record<string, unknown>
   const atId = resolveAtUserId(session)
   if (atId) bag[MAI_TRIGGER_USER_ID] = atId
-  if (session.messageId) bag[MAI_TRIGGER_MESSAGE_ID] = session.messageId
+  const mid = session.messageId
+  if (mid !== undefined && mid !== null && mid !== '') {
+    bag[MAI_TRIGGER_MESSAGE_ID] = String(mid)
+  }
+}
+
+/** 群聊回复：暂存触发消息元数据并包装 session.send */
+function prepareGroupReplySession(session: Session, replyInGroup: boolean): void {
+  if (!shouldUseGroupReply(session, replyInGroup)) return
+  stashTriggerSessionMeta(session)
+  patchSessionSendForGroupReply(session)
 }
 
 function shouldUseGroupReply(session: Session, replyInGroup: boolean): boolean {
@@ -471,7 +487,7 @@ function wrapForGroupReply(session: Session, content: unknown): Fragment {
   const messageId = getTriggerMessageId(session)
   const parts: unknown[] = []
 
-  if (messageId) parts.push(h.quote(messageId))
+  if (messageId) parts.push(h.quote(String(messageId)))
   if (atId) parts.push(h.at(atId), '\n')
 
   if (typeof content === 'string') {
@@ -1829,7 +1845,7 @@ async function getQrText(
     await tracker.send(message)
     logger.info(`等待用户 ${session.userId} 输入 SGID/链接，超时: ${actualTimeout}ms`)
     
-    const promptSession = await waitForUserReply(session, ctx, actualTimeout)
+    const promptSession = await waitForUserReply(session, ctx, actualTimeout, tracker.messageIds())
     const promptText = promptSession?.content?.trim() || ''
     if (!promptText) {
       await tracker.recall()
@@ -2144,9 +2160,8 @@ export function apply(ctx: Context, config: Config) {
     } catch {
       // bind 插件不可用时回退 session.userId / author
     }
-    stashTriggerSessionMeta(sess)
+    prepareGroupReplySession(sess, true)
     enableGuildReplyOnSession(sess, true)
-    patchSessionSendForGroupReply(sess)
   })
 
   ctx.on('command/before-execute', async (argv) => {
@@ -3070,13 +3085,11 @@ export function apply(ctx: Context, config: Config) {
   ctx.middleware(async (session, next) => {
     const content = session.content?.trim() || ''
     if (!content.match(/^\/?mai/i)) return next()
-    if (replyInGroupEnabled && session.guildId) {
-      stashTriggerSessionMeta(session)
-    }
+    prepareGroupReplySession(session, replyInGroupEnabled)
     enableGuildReplyOnSession(session, replyInGroupEnabled)
     try {
       const result = await next()
-      if (typeof result === 'string' && shouldUseGroupReply(session, replyInGroupEnabled)) {
+      if (typeof result === 'string' && result && shouldUseGroupReply(session, replyInGroupEnabled)) {
         return wrapForGroupReply(session, result)
       }
       return result
