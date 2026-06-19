@@ -130,7 +130,9 @@ async function moveBinding(ctx: Context, fromKey: string, toKey: string): Promis
     await ctx.database.remove('maibot_bindings', { userId: fromKey })
     return
   }
-  await ctx.database.set('maibot_bindings', { userId: fromKey }, { userId: toKey })
+  const { id: _id, userId: _from, ...rest } = row
+  await ctx.database.create('maibot_bindings', { ...rest, userId: toKey })
+  await ctx.database.remove('maibot_bindings', { userId: fromKey })
 }
 
 async function moveSimpleUserRows(
@@ -147,7 +149,9 @@ async function moveSimpleUserRows(
     await ctx.database.remove(table, { userId: fromKey })
     return
   }
-  await ctx.database.set(table, { userId: fromKey }, { userId: toKey })
+  const { userId: _from, ...rest } = rows[0]
+  await ctx.database.create(table, { ...rest, userId: toKey })
+  await ctx.database.remove(table, { userId: fromKey })
 }
 
 async function moveCooldownRows(ctx: Context, fromKey: string, toKey: string): Promise<void> {
@@ -162,7 +166,12 @@ async function moveCooldownRows(ctx: Context, fromKey: string, toKey: string): P
       await ctx.database.remove('maibot_user_cooldowns', { userId: fromKey, slot })
       continue
     }
-    await ctx.database.set('maibot_user_cooldowns', { userId: fromKey, slot }, { userId: toKey })
+    await ctx.database.create('maibot_user_cooldowns', {
+      userId: toKey,
+      slot,
+      lastAt: row.lastAt,
+    })
+    await ctx.database.remove('maibot_user_cooldowns', { userId: fromKey, slot })
   }
 }
 

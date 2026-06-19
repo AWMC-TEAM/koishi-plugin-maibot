@@ -409,6 +409,27 @@ function isMaiPluginCommandName(name: string): boolean {
   return name.trim().startsWith('mai')
 }
 
+function normalizeMaiCommandName(name: string): string {
+  return name.trim().toLowerCase()
+}
+
+/** Token 直连模式白名单（canonical 指令名，别名由 Koishi 解析后再比对） */
+function isTokenOnlyAllowedCommand(name: string): boolean {
+  const cmd = normalizeMaiCommandName(name)
+  if (cmd === 'mai') return true
+  if (cmd.startsWith('mai管理员') || cmd === 'maibypass') return true
+  return new Set([
+    'mai绑定水鱼',
+    'mai解绑水鱼',
+    'mai绑定落雪',
+    'mai解绑落雪',
+    'mai上传b50',
+    'maiua',
+    'mai上传落雪b50',
+    'mai发票',
+  ]).has(cmd)
+}
+
 /**
  * <spec:text> 会把「clear -g 群号」整段吃成一个参数；从首尾拆出 -g 群标识，并与 .option('-g') 合并（优先已解析的 -g）。
  */
@@ -1379,8 +1400,8 @@ async function getOrCreateBindingByUserKey(ctx: Context, userId: string): Promis
 
 function shouldVerifyBindingIdentity(binding: UserBinding | null, tokenOnlyMode: boolean): boolean {
   if (!binding) return false
-  if (!tokenOnlyMode) return true
-  return isDxBound(binding)
+  if (tokenOnlyMode) return false
+  return true
 }
 
 async function updateBindingBySession(ctx: Context, session: Session, data: Partial<UserBinding>): Promise<boolean> {
@@ -1617,16 +1638,22 @@ async function getQrText(
 ): Promise<{ qrText: string; error?: string; fromCache?: boolean }> {
   const logger = ctx.logger('maibot')
   
-  // 如果启用缓存且binding存在，检查是否有缓存（仍会用 preview 校验身份）
+  const tokenOnlyMode = config.tokenOnlyMode === true
+
+  // 如果启用缓存且binding存在，检查是否有缓存（非 Token 模式会用 preview 校验身份）
   const cacheMinutes = config.sgidCacheMinutes ?? 10
   if (useCache && cacheMinutes > 0 && binding && binding.lastQrCode && binding.lastQrCodeTime) {
     const cacheAge = Date.now() - new Date(binding.lastQrCodeTime).getTime()
     const cacheValidDuration = cacheMinutes * 60 * 1000
     
     if (cacheAge < cacheValidDuration && binding.lastQrCode.startsWith('SGWCMAID')) {
+      if (tokenOnlyMode) {
+        logger.info(`Token 模式：使用缓存的SGID（${Math.floor(cacheAge / 1000)}秒前输入）`)
+        return { qrText: binding.lastQrCode, fromCache: true }
+      }
       try {
         const previewCached = await api.getPreview(config.machineInfo?.clientId ?? '', binding.lastQrCode)
-        if (shouldVerifyBindingIdentity(binding, config.tokenOnlyMode === true)) {
+        if (shouldVerifyBindingIdentity(binding, tokenOnlyMode)) {
           const vr = verifyPreviewMatchesBinding(binding, previewCached)
           const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
           if (!hv.blocked) {
@@ -1744,7 +1771,19 @@ async function getQrText(
     
     // 尝试撤回用户发送的消息（如果启用了自动撤回）
     await tryRecallMessage(session, ctx, config)
-    
+
+    if (tokenOnlyMode) {
+      if (binding) {
+        const patch: Record<string, unknown> = {
+          lastQrCode: qrText,
+          lastQrCodeTime: new Date(),
+        }
+        await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
+        logger.info(`Token 模式：已更新用户 ${binding.userId} 的 SGID 缓存`)
+      }
+      return { qrText }
+    }
+
     const processingTracker = createBotMessageTracker(session, ctx, recallInteractive)
     await processingTracker.send('⏳ 正在处理，请稍候...')
     
@@ -1756,7 +1795,7 @@ async function getQrText(
         return { qrText: '', error: '无效或过期的二维码' }
       }
       if (binding) {
-        if (shouldVerifyBindingIdentity(binding, config.tokenOnlyMode === true)) {
+        if (shouldVerifyBindingIdentity(binding, tokenOnlyMode)) {
           const vr = verifyPreviewMatchesBinding(binding, preview)
           const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
           if (hv.blocked) {
@@ -1768,9 +1807,7 @@ async function getQrText(
         const patch: Record<string, unknown> = {
           lastQrCode: qrText,
           lastQrCodeTime: new Date(),
-        }
-        if (config.tokenOnlyMode !== true) {
-          patch.qrCode = qrText
+          qrCode: qrText,
         }
         if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
           patch.boundPlayerName = String(preview.UserName).trim()
@@ -2739,32 +2776,18 @@ export function apply(ctx: Context, config: Config) {
     return PUBLIC_API_UNAVAILABLE_MSG
   }, true)
 
-  /** Token 直连模式：仅允许 B50 / 发票 / Token 绑定相关指令 */
-  ctx.middleware(async (session, next) => {
-    if (!tokenOnlyModeEnabled) return next()
-    const content = session.content?.trim() || ''
-    if (!content.match(/^\/?mai/i)) return next()
-    if (isDebugSession(session)) return next()
-
-    const baseCmd = (content.replace(/^\//, '').split(/\s+/)[0] || '').toLowerCase()
-    if (
-      baseCmd === 'mai'
-      || baseCmd === 'mai帮助'
-      || baseCmd === 'mai绑定水鱼'
-      || baseCmd === 'mai解绑水鱼'
-      || baseCmd === 'mai绑定落雪'
-      || baseCmd === 'mai解绑落雪'
-      || baseCmd === 'mai上传b50'
-      || baseCmd === 'maiua'
-      || baseCmd === 'mai上传落雪b50'
-      || baseCmd === 'mai发票'
-      || baseCmd.startsWith('mai管理员')
-      || baseCmd === 'maibypass'
-    ) {
-      return next()
-    }
+  /** Token 直连模式：按 canonical 指令名拦截（兼容 Koishi 别名） */
+  ctx.on('command/before-execute', async (argv) => {
+    if (!tokenOnlyModeEnabled) return
+    const sess = argv.session
+    const cmd = argv.command
+    if (!sess || !cmd) return
+    if (isDebugSession(sess)) return
+    const cmdName = String(cmd.name || '')
+    if (!isMaiPluginCommandName(cmdName)) return
+    if (isTokenOnlyAllowedCommand(cmdName)) return
     return TOKEN_ONLY_MODE_BLOCKED_MSG
-  }, true)
+  })
 
   // 测试阶段警示：协议确认后、首次使用功能前须确认
   ctx.middleware(async (session, next) => {
@@ -3074,6 +3097,44 @@ export function apply(ctx: Context, config: Config) {
       patch.boundPlayerName = String(preview.UserName).trim()
     }
     return patch
+  }
+
+  /** 命令行直接携带 SGID 时：Token 模式跳过 preview，否则走 preview 与绑定校验 */
+  async function resolveInlineQrText(
+    qrCode: string,
+    binding: UserBinding,
+    session: Session,
+  ): Promise<{ qrText: string; error?: string; fromCache?: boolean }> {
+    if (tokenOnlyModeEnabled) {
+      if (!qrCode.startsWith('SGWCMAID')) {
+        return { qrText: '', error: '❌ SGID 格式错误，需以 SGWCMAID 开头' }
+      }
+      await ctx.database.set(
+        'maibot_bindings',
+        { userId: binding.userId },
+        patchQrCacheFromPreview(binding, qrCode, {}),
+      )
+      return { qrText: qrCode }
+    }
+    try {
+      const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
+      if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
+        return { qrText: '', error: '❌ 无效或过期的二维码，请重新发送' }
+      }
+      const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
+      if (vc.blocked) {
+        return { qrText: '', error: vc.message }
+      }
+      if (vc.migrationNotice) await session.send(vc.migrationNotice)
+      await ctx.database.set(
+        'maibot_bindings',
+        { userId: binding.userId },
+        patchQrCacheFromPreview(binding, qrCode, preview),
+      )
+      return { qrText: qrCode }
+    } catch (error: any) {
+      return { qrText: '', error: `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}` }
+    }
   }
 
   async function recallBotMessages(session: Session, messageIds: string[] | undefined): Promise<void> {
@@ -3410,7 +3471,7 @@ export function apply(ctx: Context, config: Config) {
   /maiua - 同时上传B50到水鱼和落雪
 
 🎫 票券：
-  /mai发票 [倍数] - 发放功能票（2-6倍）
+  /mai发票 [倍数] - 发放功能票（2 或 3 倍）
 
 关闭 Token 直连模式后，未完成舞萌绑定的用户须使用 /mai绑定。`
         if (canProxy) {
@@ -3472,7 +3533,7 @@ export function apply(ctx: Context, config: Config) {
           helpText += `
 
 🎫 票券管理（异步入队，走充值队列，约 2–3 分钟）：
-  /mai发票 [倍数] - 为账号发放功能票（2-6倍，默认2倍）
+  /mai发票 [倍数] - 为账号发放功能票（2 或 3 倍，默认 2 倍）
   /mai清票 - 清空账号的所有功能票`
 
           if (canProxy) {
@@ -4792,10 +4853,10 @@ export function apply(ctx: Context, config: Config) {
   // public/team 均可用：公共网关已支持 /v1/*_manual 兼容（上传成绩 / 解锁收藏品等）
   {
   /**
-   * 发票（2-6倍票）
-   * 用法: /mai发票 [倍数] [@用户id]，默认2
+   * 发票（2 或 3 倍票）
+   * 用法: /mai发票 [倍数] [@用户id]，默认 2
    */
-  ctx.command('mai发票 [multiple:number] [targetUserId:text]', '为账号发放功能票（2-6倍）')
+  ctx.command('mai发票 [multiple:number] [targetUserId:text]', '为账号发放功能票（2 或 3 倍）')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
     .action(async ({ session, options }, multipleInput, targetUserId) => {
@@ -4810,8 +4871,8 @@ export function apply(ctx: Context, config: Config) {
       }
 
       const multiple = multipleInput ? Number(multipleInput) : 2
-      if (!Number.isInteger(multiple) || multiple < 2 || multiple > 6) {
-        return '❌ 倍数必须是2-6之间的整数\n例如：/mai发票 3\n例如：/mai发票 6 @userid'
+      if (!Number.isInteger(multiple) || (multiple !== 2 && multiple !== 3)) {
+        return '❌ 倍数只能是 2 或 3\n例如：/mai发票 3\n例如：/mai发票 2 @userid'
       }
 
       try {
@@ -4826,25 +4887,10 @@ export function apply(ctx: Context, config: Config) {
         
         // 确认操作（如果未使用 -bypass）
         if (!options?.bypass) {
-          if (multiple >= 4) {
-            // 4-6倍：提示失败风险并二次确认
-            const baseTip = `⚠️ 即将发放 ${multiple} 倍票${proxyTip}\n\n⚠️ 警告：4倍及以上票券极有可能失败，请谨慎操作！`
-            const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
-            if (!confirmFirst) {
-              return '操作已取消（第一次确认未通过）'
-            }
-
-            const confirmSecond = await promptYesLocal(session, `二次确认：${multiple}倍票券失败风险极高，确定要继续吗？\n若理解风险，请再次输入 Y 执行`)
-            if (!confirmSecond) {
-              return '操作已取消（第二次确认未通过）'
-            }
-          } else {
-            // 2-3倍：一次确认
-            const baseTip = `⚠️ 即将发放 ${multiple} 倍票${proxyTip}`
-            const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎\n确认继续？`)
-            if (!confirmFirst) {
-              return '操作已取消（确认未通过）'
-            }
+          const baseTip = `⚠️ 即将发放 ${multiple} 倍票${proxyTip}`
+          const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎\n确认继续？`)
+          if (!confirmFirst) {
+            return '操作已取消（确认未通过）'
           }
         }
 
@@ -5137,21 +5183,11 @@ export function apply(ctx: Context, config: Config) {
         // 获取qr_text（如果提供了SGID参数则直接使用，否则交互式获取）
         let qrTextResult
         if (qrCode) {
-          try {
-            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
-            if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
-              return '❌ 无效或过期的二维码，请重新发送'
-            }
-            const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
-            if (vc.blocked) {
-              return vc.message
-            }
-            if (vc.migrationNotice) await session.send(vc.migrationNotice)
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patchQrCacheFromPreview(binding, qrCode, preview))
-            qrTextResult = { qrText: qrCode }
-          } catch (error: any) {
-            return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
+          const resolved = await resolveInlineQrText(qrCode, binding, session)
+          if (resolved.error) {
+            return resolved.error
           }
+          qrTextResult = resolved
         } else {
           qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
         }
@@ -5339,21 +5375,11 @@ export function apply(ctx: Context, config: Config) {
         // 获取qr_text（SGID输入一次）
         let qrTextResult
         if (qrCode) {
-          try {
-            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
-            if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
-              return '❌ 无效或过期的二维码，请重新发送'
-            }
-            const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
-            if (vc.blocked) {
-              return vc.message
-            }
-            if (vc.migrationNotice) await session.send(vc.migrationNotice)
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patchQrCacheFromPreview(binding, qrCode, preview))
-            qrTextResult = { qrText: qrCode }
-          } catch (error: any) {
-            return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
+          const resolved = await resolveInlineQrText(qrCode, binding, session)
+          if (resolved.error) {
+            return resolved.error
           }
+          qrTextResult = resolved
         } else {
           qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
         }
@@ -5838,21 +5864,11 @@ export function apply(ctx: Context, config: Config) {
         // 获取 qr_text：命令带 SGID/链接则校验并使用（并更新缓存）；否则交互式获取或使用缓存（与上传 B50 一致）
         let qrTextResult: { qrText: string; error?: string; fromCache?: boolean }
         if (qrCode) {
-          try {
-            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
-            if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
-              return '❌ 无效或过期的二维码，请重新发送'
-            }
-            const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
-            if (vc.blocked) {
-              return vc.message
-            }
-            if (vc.migrationNotice) await session.send(vc.migrationNotice)
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patchQrCacheFromPreview(binding, qrCode, preview))
-            qrTextResult = { qrText: qrCode }
-          } catch (error: any) {
-            return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
+          const resolved = await resolveInlineQrText(qrCode, binding, session)
+          if (resolved.error) {
+            return resolved.error
           }
+          qrTextResult = resolved
         } else {
           qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
           if (qrTextResult.error) {
@@ -6065,21 +6081,11 @@ export function apply(ctx: Context, config: Config) {
 
         let qrTextResult: { qrText: string; error?: string; fromCache?: boolean }
         if (qrCode) {
-          try {
-            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
-            if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
-              return '❌ 无效或过期的二维码，请重新发送'
-            }
-            const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
-            if (vc.blocked) {
-              return vc.message
-            }
-            if (vc.migrationNotice) await session.send(vc.migrationNotice)
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patchQrCacheFromPreview(binding, qrCode, preview))
-            qrTextResult = { qrText: qrCode }
-          } catch (err: any) {
-            return `❌ 验证二维码失败：${getSafeErrorMessage(err, session)}`
+          const resolved = await resolveInlineQrText(qrCode, binding, session)
+          if (resolved.error) {
+            return resolved.error
           }
+          qrTextResult = resolved
         } else {
           qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
           if (qrTextResult.error) {
@@ -6089,12 +6095,14 @@ export function apply(ctx: Context, config: Config) {
 
         let currentRom = ''
         let currentData = ''
-        try {
-          const preview = await api.getPreview(machineInfo?.clientId ?? '', qrTextResult.qrText)
-          if (preview.RomVersion) currentRom = preview.RomVersion
-          if (preview.DataVersion) currentData = preview.DataVersion
-        } catch {
-          // 忽略预览失败，继续让用户输入
+        if (!tokenOnlyModeEnabled) {
+          try {
+            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrTextResult.qrText)
+            if (preview.RomVersion) currentRom = preview.RomVersion
+            if (preview.DataVersion) currentData = preview.DataVersion
+          } catch {
+            // 忽略预览失败，继续让用户输入
+          }
         }
 
         const versionHint = currentRom || currentData
@@ -6573,21 +6581,11 @@ export function apply(ctx: Context, config: Config) {
         // 获取qr_text（如果提供了SGID参数则直接使用，否则交互式获取）
         let qrTextResult
         if (qrCode) {
-          try {
-            const preview = await api.getPreview(machineInfo?.clientId ?? '', qrCode)
-            if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
-              return '❌ 无效或过期的二维码，请重新发送'
-            }
-            const vc = await verifyQrPreviewIfNeeded(binding, preview, session)
-            if (vc.blocked) {
-              return vc.message
-            }
-            if (vc.migrationNotice) await session.send(vc.migrationNotice)
-            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patchQrCacheFromPreview(binding, qrCode, preview))
-            qrTextResult = { qrText: qrCode }
-          } catch (error: any) {
-            return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
+          const resolved = await resolveInlineQrText(qrCode, binding, session)
+          if (resolved.error) {
+            return resolved.error
           }
+          qrTextResult = resolved
         } else {
           qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
         }
