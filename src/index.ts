@@ -418,20 +418,98 @@ function sanitizeError(error: any): string {
 /** Session 上暂存当前正在执行的指令用法（由 command/before-execute 写入） */
 const MAI_SESSION_CMD_USAGE_KEY = '__maiCmdUsageHint'
 const MAI_GUILD_REPLY_KEY = '__maiGuildReplyEnabled'
+const MAI_TRIGGER_USER_ID = '__maiTriggerUserId'
+const MAI_TRIGGER_MESSAGE_ID = '__maiTriggerMessageId'
+const MAI_ORIGINAL_SEND = '__maiOriginalSessionSend'
+
+/** 解析可用于 @ 的平台用户 ID（优先纯数字 QQ 号） */
+function resolveAtUserId(session: Session): string | null {
+  const bag = session as unknown as Record<string, unknown>
+  const candidates = [
+    bag[MAI_TRIGGER_USER_ID],
+    session.userId,
+    session.author?.userId,
+    (session as { uid?: string }).uid,
+  ]
+  for (const raw of candidates) {
+    if (raw === undefined || raw === null || raw === '') continue
+    const s = String(raw)
+    if (/^\d+$/.test(s)) return s
+    const prefixed = s.match(/:(\d+)$/)
+    if (prefixed?.[1]) return prefixed[1]
+  }
+  return null
+}
+
+function getTriggerMessageId(session: Session): string | undefined {
+  const bag = session as unknown as Record<string, unknown>
+  const stored = bag[MAI_TRIGGER_MESSAGE_ID]
+  if (typeof stored === 'string' && stored) return stored
+  return session.messageId
+}
+
+function stashTriggerSessionMeta(session: Session): void {
+  const bag = session as unknown as Record<string, unknown>
+  const atId = resolveAtUserId(session)
+  if (atId) bag[MAI_TRIGGER_USER_ID] = atId
+  if (session.messageId) bag[MAI_TRIGGER_MESSAGE_ID] = session.messageId
+}
 
 function shouldUseGroupReply(session: Session, replyInGroup: boolean): boolean {
-  return replyInGroup && !!session.guildId && !!session.userId
+  return replyInGroup && !!session.guildId
+}
+
+/** 去掉正文里遗留的 XML @ 标签，避免与 h.at 重复或原样显示 */
+function stripLegacyAtTags(text: string): string {
+  return text.replace(/<at\s+id=["'][^"']+["']\s*\/?>\s*/gi, '')
 }
 
 function wrapForGroupReply(session: Session, content: unknown): Fragment {
   if (content == null) return ''
-  if (typeof content !== 'string') return content as Fragment
-  if (content.includes('<at id=')) return content
-  const text = `${buildMention(session)}\n${content}`
-  if (session.messageId) {
-    return [h.quote(session.messageId), text]
+
+  const atId = resolveAtUserId(session)
+  const messageId = getTriggerMessageId(session)
+  const parts: unknown[] = []
+
+  if (messageId) parts.push(h.quote(messageId))
+  if (atId) parts.push(h.at(atId), '\n')
+
+  if (typeof content === 'string') {
+    const body = stripLegacyAtTags(content)
+    if (body) parts.push(body)
+  } else if (Array.isArray(content)) {
+    for (const item of content) {
+      if (Array.isArray(item)) {
+        for (const sub of item) parts.push(sub)
+      } else {
+        parts.push(item)
+      }
+    }
+  } else {
+    parts.push(content)
   }
-  return text
+
+  if (parts.length === 0) return ''
+  return parts as Fragment
+}
+
+function patchSessionSendForGroupReply(session: Session): void {
+  const bag = session as unknown as Record<string, unknown>
+  if (bag[MAI_ORIGINAL_SEND]) return
+  const originalSend = session.send.bind(session)
+  bag[MAI_ORIGINAL_SEND] = originalSend
+  session.send = async (content: unknown) => {
+    return originalSend(wrapForGroupReply(session, content))
+  }
+}
+
+function restoreSessionSend(session: Session): void {
+  const bag = session as unknown as Record<string, unknown>
+  const originalSend = bag[MAI_ORIGINAL_SEND]
+  if (typeof originalSend === 'function') {
+    session.send = originalSend as Session['send']
+    delete bag[MAI_ORIGINAL_SEND]
+  }
 }
 
 function enableGuildReplyOnSession(session: Session, replyInGroup: boolean): void {
@@ -640,11 +718,29 @@ function rowCardKindOf(row: { cardKind?: string }): 'personal' | 'group' | 'unbi
   return 'personal'
 }
 
-function buildMention(session: Session): string {
-  if (session.userId) {
-    return `<at id="${session.userId}"/>`
-  }
+function buildMention(session: Session): Fragment {
+  const atId = resolveAtUserId(session)
+  if (atId) return h.at(atId)
   return `@${session.author?.nickname || session.username || '玩家'}`
+}
+
+/** 渲染带 {playerid}、{at} 占位符的通知模板为 Fragment（{at} 使用 h.at，非 XML 字符串） */
+function renderNotifyTemplate(
+  template: string,
+  vars: { playerName?: string; atUserId?: string | null },
+): Fragment {
+  const parts: unknown[] = []
+  const re = /\{playerid\}|\{at\}/g
+  let last = 0
+  let match: RegExpExecArray | null
+  while ((match = re.exec(template))) {
+    if (match.index > last) parts.push(template.slice(last, match.index))
+    if (match[0] === '{playerid}') parts.push(vars.playerName ?? '')
+    else if (match[0] === '{at}' && vars.atUserId) parts.push(h.at(vars.atUserId))
+    last = re.lastIndex
+  }
+  if (last < template.length) parts.push(template.slice(last))
+  return parts as Fragment
 }
 
 // promptYes 函数将在 apply 函数内部重新定义以使用配置
@@ -1931,10 +2027,6 @@ export function apply(ctx: Context, config: Config) {
   ctx.on('before-send', (session: Session) => {
     const c = session.content
     if (typeof c === 'string') {
-      const bag = session as unknown as Record<string, unknown>
-      if (bag[MAI_GUILD_REPLY_KEY] && !c.includes('<at id=')) {
-        session.content = wrapForGroupReply(session, c) as typeof session.content
-      }
       const t = c.trim()
       if (t.length <= 200 && /^(发生未知错误\.?|未知错误\.?|An unknown error\.?)$/i.test(t)) {
         const extra = formatCommandUsageAppend(session)
@@ -2038,6 +2130,24 @@ export function apply(ctx: Context, config: Config) {
     const keys = await getSessionBindingKeys(ctx, session)
     return keys[0] || String(session.userId || '')
   }
+
+  ctx.on('command/before-execute', async (argv) => {
+    const sess = argv.session
+    const cmd = argv.command
+    if (!sess || !cmd || !replyInGroupEnabled || !sess.guildId) return
+    if (!isMaiPluginCommandName(String(cmd.name || ''))) return
+    try {
+      const user = await sess.observeUser(['id'])
+      if (user?.id != null) {
+        ;(sess as unknown as Record<string, unknown>)[MAI_TRIGGER_USER_ID] = String(user.id)
+      }
+    } catch {
+      // bind 插件不可用时回退 session.userId / author
+    }
+    stashTriggerSessionMeta(sess)
+    enableGuildReplyOnSession(sess, true)
+    patchSessionSendForGroupReply(sess)
+  })
 
   ctx.on('command/before-execute', async (argv) => {
     const sess = argv.session
@@ -2263,10 +2373,7 @@ export function apply(ctx: Context, config: Config) {
    */
   async function sendAndGetMessageIds(session: Session, content: string): Promise<string[]> {
     try {
-      const payload = (session as unknown as Record<string, unknown>)[MAI_GUILD_REPLY_KEY]
-        ? wrapForGroupReply(session, content)
-        : content
-      const result = await session.send(payload as string)
+      const result = await session.send(content)
       // session.send 返回消息ID数组
       if (Array.isArray(result)) {
         return result.filter(id => id && typeof id === 'string')
@@ -2963,6 +3070,9 @@ export function apply(ctx: Context, config: Config) {
   ctx.middleware(async (session, next) => {
     const content = session.content?.trim() || ''
     if (!content.match(/^\/?mai/i)) return next()
+    if (replyInGroupEnabled && session.guildId) {
+      stashTriggerSessionMeta(session)
+    }
     enableGuildReplyOnSession(session, replyInGroupEnabled)
     try {
       const result = await next()
@@ -2971,6 +3081,7 @@ export function apply(ctx: Context, config: Config) {
       }
       return result
     } finally {
+      restoreSessionSend(session)
       disableGuildReplyOnSession(session)
     }
   }, true)
@@ -3245,6 +3356,7 @@ export function apply(ctx: Context, config: Config) {
 
   const scheduleB50Notification = (session: Session, taskId: string, initialRefId?: string, messagesToRecall?: string[]) => {
     if (!taskId) return
+    stashTriggerSessionMeta(session)
     const bot = session.bot
     const channelId = session.channelId
     if (!bot || !channelId) {
@@ -3252,7 +3364,6 @@ export function apply(ctx: Context, config: Config) {
       return
     }
 
-    const mention = buildMention(session)
     const guildId = session.guildId
     const pollInterval = config.b50PollInterval ?? 2000
     const pollTimeout = config.b50PollTimeout ?? 600000  // 默认10分钟超时
@@ -3309,12 +3420,8 @@ export function apply(ctx: Context, config: Config) {
             apiResponse: { ...detail, alive_task_id: taskId },
           })
           
-          const finalMessage = `${mention} 水鱼B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`
-          await bot.sendMessage(
-            channelId,
-            appendRefId(finalMessage, taskRefId),
-            guildId,
-          )
+          const finalMessage = `水鱼B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`
+          await sendBotNotification(session, appendRefId(finalMessage, taskRefId))
           return
         }
         
@@ -3334,16 +3441,12 @@ export function apply(ctx: Context, config: Config) {
           errorMessage: `任务轮询超时（${Math.round(pollTimeout / 60000)}分钟）`,
         })
         
-        let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
+        let msg = `水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
           msg += `\n${maintenanceMsg}`
         }
-        await bot.sendMessage(
-          channelId,
-          appendRefId(msg, timeoutRefId),
-          guildId,
-        )
+        await sendBotNotification(session, appendRefId(msg, timeoutRefId))
       } catch (error) {
         logger.warn(`轮询B50任务状态失败: ${sanitizeError(error)}`)
         if (attempts < maxAttempts) {
@@ -3361,16 +3464,12 @@ export function apply(ctx: Context, config: Config) {
           errorMessage: error instanceof Error ? sanitizeErrorMessage(error.message) : '未知错误',
         })
         
-        let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
+        let msg = `水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
           msg += `\n${maintenanceMsg}`
         }
-        await bot.sendMessage(
-          channelId,
-          appendRefId(msg, errorRefId),
-          guildId,
-        )
+        await sendBotNotification(session, appendRefId(msg, errorRefId))
       }
     }
 
@@ -3380,6 +3479,7 @@ export function apply(ctx: Context, config: Config) {
 
   const scheduleLxB50Notification = (session: Session, taskId: string, initialRefId?: string, messagesToRecall?: string[]) => {
     if (!taskId) return
+    stashTriggerSessionMeta(session)
     const bot = session.bot
     const channelId = session.channelId
     if (!bot || !channelId) {
@@ -3387,7 +3487,6 @@ export function apply(ctx: Context, config: Config) {
       return
     }
 
-    const mention = buildMention(session)
     const guildId = session.guildId
     const pollInterval = config.b50PollInterval ?? 2000
     const pollTimeout = config.b50PollTimeout ?? 600000  // 默认10分钟超时
@@ -3444,12 +3543,8 @@ export function apply(ctx: Context, config: Config) {
             apiResponse: { ...detail, alive_task_id: taskId },
           })
           
-          const finalMessage = `${mention} 落雪B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`
-          await bot.sendMessage(
-            channelId,
-            appendRefId(finalMessage, taskRefId),
-            guildId,
-          )
+          const finalMessage = `落雪B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`
+          await sendBotNotification(session, appendRefId(finalMessage, taskRefId))
           return
         }
         
@@ -3469,16 +3564,12 @@ export function apply(ctx: Context, config: Config) {
           errorMessage: `任务轮询超时（${Math.round(pollTimeout / 60000)}分钟）`,
         })
         
-        let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
+        let msg = `落雪B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
           msg += `\n${maintenanceMsg}`
         }
-        await bot.sendMessage(
-          channelId,
-          appendRefId(msg, timeoutRefId),
-          guildId,
-        )
+        await sendBotNotification(session, appendRefId(msg, timeoutRefId))
       } catch (error) {
         logger.warn(`轮询落雪B50任务状态失败: ${sanitizeError(error)}`)
         if (attempts < maxAttempts) {
@@ -3496,16 +3587,12 @@ export function apply(ctx: Context, config: Config) {
           errorMessage: error instanceof Error ? sanitizeErrorMessage(error.message) : '未知错误',
         })
         
-        let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
+        let msg = `落雪B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
           msg += `\n${maintenanceMsg}`
         }
-        await bot.sendMessage(
-          channelId,
-          appendRefId(msg, errorRefId),
-          guildId,
-        )
+        await sendBotNotification(session, appendRefId(msg, errorRefId))
       }
     }
 
@@ -3529,6 +3616,7 @@ export function apply(ctx: Context, config: Config) {
     params: { chargeId: number; qrText: string; submitRefId?: string },
   ) => {
     if (isPublicApi) return
+    stashTriggerSessionMeta(session)
     const bot = session.bot
     const channelId = session.channelId
     if (!bot || !channelId) return
@@ -7403,11 +7491,10 @@ export function apply(ctx: Context, config: Config) {
               // 获取玩家名
               // 获取玩家名
               const playerName = preview.UserName || binding.userName || '玩家'
-              const mention = `<at id="${binding.userId}"/>`
-              // 使用配置的消息模板
-              const message = protectionLockMessage
-                .replace(/{playerid}/g, playerName)
-                .replace(/{at}/g, mention)
+              const message = renderNotifyTemplate(protectionLockMessage, {
+                playerName,
+                atUserId: binding.userId,
+              })
               
               // 尝试使用第一个可用的bot发送消息
               let sent = false
