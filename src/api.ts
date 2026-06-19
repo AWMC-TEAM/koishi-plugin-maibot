@@ -1,4 +1,4 @@
-import axios, { AxiosInstance } from 'axios'
+import axios, { AxiosInstance, AxiosError } from 'axios'
 import { AsyncLocalStorage } from 'async_hooks'
 
 export interface ApiConfig {
@@ -6,10 +6,27 @@ export interface ApiConfig {
   timeout?: number
   retryCount?: number
   retryDelay?: number
-  /** team：自建服务 `/api/public`；public：AWMC 网关 `/v1` + Bearer */
+  /** team：sw-api `/awmc/api/v1` + 旧私有端点；public：AWMC 网关 `/v1` + Bearer */
   apiStyle?: 'team' | 'public'
   /** apiStyle 为 public 时必填，对应网关 `Authorization: Bearer <令牌>` */
   bearerToken?: string
+}
+
+/** B50 上传响应（public 异步任务 / team sw-api 同步完成） */
+export interface B50UploadResponse {
+  UploadStatus: boolean
+  msg: string
+  task_id: string
+  login_time?: number
+  userID?: string
+  token?: string
+  /** team sw-api：同步上传，无需轮询任务 */
+  sync?: boolean
+  count?: number
+}
+
+export function isSyncB50Upload(result: { sync?: boolean }): boolean {
+  return result.sync === true
 }
 
 /** 调试上下文：在 API 调用栈中传递「来源是否为调试会话」的标记 */
@@ -172,17 +189,49 @@ export class MaiBotAPI {
     )
   }
 
+  private swPath(suffix: string): string {
+    return `/awmc/api/v1${suffix}`
+  }
+
+  private swKeychipBody(
+    qrcode: string,
+    keychip: string,
+    regionId?: number,
+    placeId?: number,
+  ): Record<string, unknown> {
+    const body: Record<string, unknown> = { qrcode, keychip }
+    if (regionId != null) body.regionId = regionId
+    if (placeId != null) body.placeId = placeId
+    return body
+  }
+
+  private extractSwError(error: unknown): string {
+    const err = error as AxiosError<{ error?: string; msg?: string }>
+    return err.response?.data?.error
+      || err.response?.data?.msg
+      || err.message
+      || '未知错误'
+  }
+
+  /** sw-api 同步 B50 上传可能耗时较长 */
+  private static readonly SW_B50_TIMEOUT_MS = 600000
+
   /**
-   * 机台 Ping
-   * GET /api/public/mai_ping
+   * 机台 Ping / 健康检查
+   * team: GET /awmc/api/v1/health
+   * public: GET /v1/mai_ping
    */
   async maiPing(): Promise<{
     returnCode?: number
     serverTime?: number
     result?: string
+    status?: string
   }> {
-    const path = this.apiStyle === 'public' ? '/v1/mai_ping' : '/api/public/mai_ping'
-    const response = await this.client.get(path)
+    if (this.apiStyle === 'public') {
+      const response = await this.client.get('/v1/mai_ping')
+      return response.data
+    }
+    const response = await this.client.get(this.swPath('/health'))
     return response.data
   }
 
@@ -213,8 +262,8 @@ export class MaiBotAPI {
 
   /**
    * 上传水鱼 B50
-   * POST /api/public/upload_b50
-   * 需要: region_id, client_id, place_id, qr_text, fish_token
+   * team: POST /awmc/api/v1/update-fish（同步）
+   * public: POST /v1/upload_b50（异步任务）
    */
   async uploadB50(
     regionId: number,
@@ -222,27 +271,39 @@ export class MaiBotAPI {
     placeId: number,
     qrText: string,
     fishToken: string
-  ): Promise<{
-    UploadStatus: boolean
-    msg: string
-    task_id: string
-    login_time?: number
-    userID?: string
-    token?: string
-  }> {
-    const path = this.apiStyle === 'public' ? '/v1/upload_b50' : '/api/public/upload_b50'
-    const params =
-      this.apiStyle === 'public'
-        ? { qr_text: qrText, fish_token: fishToken }
-        : {
-            region_id: regionId,
-            client_id: clientId,
-            place_id: placeId,
-            qr_text: qrText,
-            fish_token: fishToken,
-          }
-    const response = await this.client.post(path, null, { params })
-    return response.data
+  ): Promise<B50UploadResponse> {
+    if (this.apiStyle === 'public') {
+      const response = await this.client.post('/v1/upload_b50', null, {
+        params: { qr_text: qrText, fish_token: fishToken },
+      })
+      return response.data
+    }
+
+    try {
+      const response = await this.client.post(
+        this.swPath('/update-fish'),
+        {
+          token: fishToken,
+          ...this.swKeychipBody(qrText, clientId, regionId, placeId),
+        },
+        { timeout: MaiBotAPI.SW_B50_TIMEOUT_MS },
+      )
+      const data = response.data as { userId?: string | number; count?: number; result?: { message?: string } }
+      return {
+        UploadStatus: true,
+        msg: data.result?.message ?? 'ok',
+        task_id: '',
+        sync: true,
+        userID: data.userId != null ? String(data.userId) : undefined,
+        count: data.count,
+      }
+    } catch (error) {
+      return {
+        UploadStatus: false,
+        msg: this.extractSwError(error),
+        task_id: '',
+      }
+    }
   }
 
   /**
@@ -292,36 +353,49 @@ export class MaiBotAPI {
 
   /**
    * 上传落雪 B50
-   * POST /api/public/upload_lx_b50
-   * 需要: region_id, client_id, place_id, qr_text, lxns_code
+   * team: POST /awmc/api/v1/update-lx（同步，`key` 为落雪导入 Token）
+   * public: POST /v1/upload_lx_b50（异步任务）
    */
   async uploadLxB50(
     regionId: number,
     clientId: string,
     placeId: number,
     qrText: string,
-    lxnsCode: string
-  ): Promise<{
-    UploadStatus: boolean
-    msg: string
-    task_id: string
-    login_time?: number
-    userID?: string
-    token?: string
-  }> {
-    const path = this.apiStyle === 'public' ? '/v1/upload_lx_b50' : '/api/public/upload_lx_b50'
-    const params =
-      this.apiStyle === 'public'
-        ? { qr_text: qrText, lxns_code: lxnsCode }
-        : {
-            region_id: regionId,
-            client_id: clientId,
-            place_id: placeId,
-            qr_text: qrText,
-            lxns_code: lxnsCode,
-          }
-    const response = await this.client.post(path, null, { params })
-    return response.data
+    lxImportToken: string
+  ): Promise<B50UploadResponse> {
+    if (this.apiStyle === 'public') {
+      const response = await this.client.post('/v1/upload_lx_b50', null, {
+        params: { qr_text: qrText, lxns_code: lxImportToken },
+      })
+      return response.data
+    }
+
+    try {
+      const response = await this.client.post(
+        this.swPath('/update-lx'),
+        {
+          key: lxImportToken,
+          type: 'maimai',
+          ...this.swKeychipBody(qrText, clientId, regionId, placeId),
+        },
+        { timeout: MaiBotAPI.SW_B50_TIMEOUT_MS },
+      )
+      const data = response.data as { userId?: string | number; count?: number; result?: { message?: string } }
+      return {
+        UploadStatus: true,
+        msg: data.result?.message ?? 'ok',
+        task_id: '',
+        sync: true,
+        userID: data.userId != null ? String(data.userId) : undefined,
+        count: data.count,
+      }
+    } catch (error) {
+      return {
+        UploadStatus: false,
+        msg: this.extractSwError(error),
+        task_id: '',
+      }
+    }
   }
 
   /**
@@ -452,8 +526,8 @@ export class MaiBotAPI {
 
   /**
    * 获取功能票
-   * team: POST /api/private/get_ticket（Query: region_id, client_id, place_id, ticket_id, qr_text）
-   * public: POST /v1/get_ticket（Query: ticket_id, qr_text）
+   * team: POST /awmc/api/v1/charge（异步入队）
+   * public: POST /v1/get_ticket
    */
   async getTicket(
     regionId: number | undefined,
@@ -466,19 +540,87 @@ export class MaiBotAPI {
     LoginStatus: boolean
     LogoutStatus: boolean
     TicketStatus: boolean
+    queueMsg?: string
   }> {
-    const path = this.apiStyle === 'public' ? '/v1/get_ticket' : '/api/private/get_ticket'
-    const params =
-      this.apiStyle === 'public'
-        ? { ticket_id: ticketId, qr_text: qrText }
-        : {
-            region_id: regionId,
-            client_id: clientId,
-            place_id: placeId,
-            ticket_id: ticketId,
-            qr_text: qrText,
-          }
-    const response = await this.client.post(path, null, { params })
+    if (this.apiStyle === 'public') {
+      const response = await this.client.post('/v1/get_ticket', null, {
+        params: { ticket_id: ticketId, qr_text: qrText },
+      })
+      return response.data
+    }
+
+    if (!clientId) {
+      return {
+        QrStatus: false,
+        LoginStatus: false,
+        LogoutStatus: false,
+        TicketStatus: false,
+        queueMsg: '缺少 keychip 配置',
+      }
+    }
+
+    try {
+      const response = await this.client.post(this.swPath('/charge'), {
+        charge: ticketId,
+        ...this.swKeychipBody(qrText, clientId, regionId, placeId),
+      })
+      const data = response.data as { code?: number; msg?: string }
+      if (data.code !== 0) {
+        return {
+          QrStatus: false,
+          LoginStatus: false,
+          LogoutStatus: false,
+          TicketStatus: false,
+          queueMsg: data.msg ?? '发票入队失败',
+        }
+      }
+      return {
+        QrStatus: true,
+        LoginStatus: true,
+        LogoutStatus: true,
+        TicketStatus: true,
+        queueMsg: data.msg,
+      }
+    } catch (error) {
+      return {
+        QrStatus: false,
+        LoginStatus: false,
+        LogoutStatus: false,
+        TicketStatus: false,
+        queueMsg: this.extractSwError(error),
+      }
+    }
+  }
+
+  /**
+   * 查询发票充值队列状态
+   * GET /awmc/api/v1/charge/queue（仅 team sw-api）
+   */
+  async getChargeQueue(): Promise<{
+    code: number
+    workers: number
+    tasks: Array<{
+      chargeId: number
+      userId: string
+      keychip: string
+      qrToken?: string
+      regionId?: number
+      placeId?: number
+      status: 'pending' | 'processing' | 'done' | 'failed'
+      msg: string
+      ts: string
+    }>
+  }> {
+    const response = await this.client.get(this.swPath('/charge/queue'))
+    return response.data
+  }
+
+  /**
+   * 调整发票充值队列 worker 数量
+   * POST /awmc/api/v1/charge/queue/config（仅 team sw-api）
+   */
+  async setChargeQueueWorkers(workers: number): Promise<{ code: number; msg: string }> {
+    const response = await this.client.post(this.swPath('/charge/queue/config'), { workers })
     return response.data
   }
 

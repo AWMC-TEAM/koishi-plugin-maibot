@@ -104,6 +104,13 @@ export interface MaiBotUserRebindState {
 export interface MaiBotUserTerms {
   userId: string
   acceptedAt: Date
+  /** 接受时的协议版本号，与配置 termsPolicy.version 比对 */
+  termsVersion?: string
+}
+
+export interface MaiBotV2Migration {
+  userId: string
+  migratedAt: Date
 }
 
 declare module 'koishi' {
@@ -118,6 +125,7 @@ declare module 'koishi' {
     maibot_group_rebind_pending: MaiBotGroupRebindPending
     maibot_user_rebind_state: MaiBotUserRebindState
     maibot_user_terms: MaiBotUserTerms
+    maibot_v2_migration: MaiBotV2Migration
   }
 }
 
@@ -243,6 +251,14 @@ export function extendDatabase(ctx: Context) {
   ctx.model.extend('maibot_user_terms', {
     userId: 'string',
     acceptedAt: 'timestamp',
+    termsVersion: 'string',
+  }, {
+    primary: 'userId',
+  })
+
+  ctx.model.extend('maibot_v2_migration', {
+    userId: 'string',
+    migratedAt: 'timestamp',
   }, {
     primary: 'userId',
   })

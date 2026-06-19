@@ -1,5 +1,5 @@
 import { Context, Schema, Session } from 'koishi'
-import { MaiBotAPI } from './api'
+import { MaiBotAPI, isSyncB50Upload } from './api'
 import {
   formatBindChangeWaitHuman,
   msUntilBindChangeAllowed,
@@ -29,6 +29,24 @@ import {
   userCancelGroupPriority,
   type PriorityCooldownConfig,
 } from './priority-cooldown'
+import {
+  getCanonicalV2UserId,
+  hasAnyMaibotUserData,
+  hasCompletedV2Migration,
+  isV2UserIdFormat,
+  markV2MigrationComplete,
+  parseMigrationConfirm,
+  clearLegacyLxnsBinding,
+  performV2UserMigration,
+  V2_MIGRATION_CONFIRM_PROMPT,
+  V2_MIGRATION_PROMPT,
+} from './v2-migration'
+import {
+  extractSgidFromSession,
+  extractSgidFromText,
+  formatSgidExtractReport,
+  processSGID,
+} from './sgid-extract'
 
 export const name = 'maibot'
 export const inject = ['database']
@@ -91,9 +109,9 @@ export interface Config {
   }
   autoRecall?: boolean  // 仅在交互输入或命令参数时自动撤回敏感消息
   queue?: {
-    enabled: boolean  // 队列系统开关
+    enabled: boolean  // 发票 Bot 侧并发队列开关
     interval: number  // 处理间隔（毫秒），默认10秒
-    message: string  // 队列提示消息模板（支持占位符：{queuePosition} 队列位置，{queueEST} 预计等待秒数）
+    message: string  // 发票排队提示模板（{queuePosition} {queueEST}）
   }
   operationLog?: {
     enabled: boolean  // 操作记录开关
@@ -113,6 +131,15 @@ export interface Config {
     minDaysBetweenBindChange: number
     shopUrl?: string
   }
+  /** 用户协议（V2）：自定义链接与确认词 */
+  termsPolicy?: {
+    url: string
+    acceptText: string
+    /** 协议版本号，变更后需用户重新确认 */
+    version: string
+  }
+  /** 交互式提示/处理中消息完成后自动撤回（仅保留结果） */
+  autoRecallInteractiveMessages?: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -128,8 +155,8 @@ export const Config: Schema<Config> = Schema.object({
     .required(false)
     .description('公共网关令牌（Bearer / gw_…，勿泄露）。申请 https://api.awmc.team · 购买额度 https://store.awmc.team'),
   apiBaseURL: Schema.string()
-    .default('http://localhost:5566')
-    .description('API 根地址。public 模式一般为 https://api.awmc.team ；team 模式为自建服务地址'),
+    .default('http://localhost:5001')
+    .description('API 根地址。team 模式一般为 sw-api 地址（如 http://localhost:5001）；public 模式一般为 https://api.awmc.team'),
   apiTimeout: Schema.number().default(30000).description('API请求超时时间（毫秒）'),
   apiRetryCount: Schema.number().default(5).description('API请求重试次数（仅在 ECONNRESET 或 504 时生效）'),
   apiRetryDelay: Schema.number().default(1000).description('API请求重试间隔（毫秒）'),
@@ -197,13 +224,13 @@ export const Config: Schema<Config> = Schema.object({
   }),
   autoRecall: Schema.boolean().default(true).description('仅在交互输入或命令参数时自动撤回敏感消息（尝试撤回，如不支持则忽略）'),
   queue: Schema.object({
-    enabled: Schema.boolean().default(false).description('队列系统开关，开启后限制并发请求'),
-    interval: Schema.number().default(10000).description('处理间隔（毫秒），默认10秒（10000毫秒），每间隔时间只处理一个请求'),
-    message: Schema.string().default('你正在排队，前面还有 {queuePosition} 人。预计等待 {queueEST} 秒。').description('队列提示消息模板（支持占位符：{queuePosition} 队列位置，{queueEST} 预计等待秒数）'),
-  }).description('请求队列配置').default({
+    enabled: Schema.boolean().default(false).description('发票 Bot 侧并发队列开关（仅 /mai发票）；开启后 Bot 串行化发票请求，与 sw-api 服务端充值队列配合使用'),
+    interval: Schema.number().default(10000).description('发票 Bot 队列处理间隔（毫秒），默认 10 秒'),
+    message: Schema.string().default('⏳ 发票排队中，前面还有 {queuePosition} 人，预计等待 {queueEST} 秒。').description('发票 Bot 队列提示模板（占位符 {queuePosition} {queueEST}）'),
+  }).description('发票请求队列（Bot 侧限流）').default({
     enabled: false,
     interval: 10000,
-    message: '你正在排队，前面还有 {queuePosition} 人。预计等待 {queueEST} 秒。',
+    message: '⏳ 发票排队中，前面还有 {queuePosition} 人，预计等待 {queueEST} 秒。',
   }),
   operationLog: Schema.object({
     enabled: Schema.boolean().default(true).description('操作记录开关，开启后记录所有操作'),
@@ -258,6 +285,19 @@ export const Config: Schema<Config> = Schema.object({
     minDaysBetweenBindChange: 30,
     shopUrl: '',
   }),
+  termsPolicy: Schema.object({
+    url: Schema.string().default('https://wiki.awmc.cc/guide/bot/terms').description('服务协议网页链接'),
+    acceptText: Schema.string().role('textarea', { rows: 4 }).default(
+      '我已认真阅读网页中的服务说明，并已了解AWMC服务可能带来的风险。我了解因使用本服务，造成舞萌DX官方账号遭到封禁，责任和AWMC无关。我确认发送二维码可能会对我的账号产生安全影响，并愿意接受这样的风险。在阅读说明后，我同意上述协议。',
+    ).description('用户需完整输入的确认词（与网页展示一致）'),
+    version: Schema.string().default('2.0.0').description('协议版本号，变更后所有用户需重新确认'),
+  }).description('用户协议配置（V2）').default({
+    url: 'https://wiki.awmc.cc/guide/bot/terms',
+    acceptText:
+      '我已认真阅读网页中的服务说明，并已了解AWMC服务可能带来的风险。我了解因使用本服务，造成舞萌DX官方账号遭到封禁，责任和AWMC无关。我确认发送二维码可能会对我的账号产生安全影响，并愿意接受这样的风险。在阅读说明后，我同意上述协议。',
+    version: '2.0.0',
+  }),
+  autoRecallInteractiveMessages: Schema.boolean().default(true).description('交互式提示与处理中消息完成后自动撤回，仅保留最终结果'),
 }).description(
   '【公共 API】申请 https://api.awmc.team',
 )
@@ -871,38 +911,20 @@ function checkAllStatusFalse(result: {
 }
 
 /**
- * 从session中提取二维码文本
- * 支持从文本消息或图片消息中提取
+ * 从session中提取二维码文本（文本 / 链接 / 图片二维码）
  */
 async function extractQRCodeFromSession(
   session: Session,
   ctx: Context
 ): Promise<string | null> {
-  // 1. 检查文本消息中是否包含SGID
-  const text = session.content?.trim() || ''
-  if (text && text.startsWith('SGWCMAID')) {
-    return text
+  const result = await extractSgidFromSession(session)
+  if (result.ok && result.qrText) {
+    ctx.logger('maibot').info(`从会话提取 SGID 成功，来源: ${result.source}`)
+    return result.qrText
   }
-
-  // 2. 检查是否有图片消息
-  if (session.elements) {
-    for (const element of session.elements) {
-      if (element.type === 'image' || element.type === 'img') {
-        // 尝试获取图片URL或本地路径
-        const imageUrl = element.attrs?.url || element.attrs?.src || element.attrs?.file
-        if (!imageUrl) {
-          continue
-        }
-
-        // 尝试从图片URL中提取（某些情况下二维码内容可能编码在URL中）
-        // 如果API支持图片二维码解析，可以在这里调用
-        // 目前先尝试从URL中提取文本（某些适配器可能会这样处理）
-        ctx.logger('maibot').warn('图片二维码解析：目前需要用户直接发送SGID文本，图片解析功能待API支持')
-        return null
-      }
-    }
+  if (result.error) {
+    ctx.logger('maibot').debug(`从会话提取 SGID 失败: ${result.error}`)
   }
-
   return null
 }
 
@@ -1120,69 +1142,6 @@ class RequestQueue {
 }
 
 /**
- * 处理并转换SGID（从URL或直接SGID）
- * @param input 用户输入的SGID或URL
- * @returns 转换后的SGID，如果格式错误返回null
- */
-function processSGID(input: string): { qrText: string } | null {
-  const trimmed = input.trim()
-  
-  // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
-  const isReqLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
-  // 检查是否为二维码图片链接格式（https://wq.wahlap.net/qrcode/img/）
-  const isImgLink = trimmed.includes('https://wq.wahlap.net/qrcode/img/')
-  const isSGID = trimmed.startsWith('SGWCMAID')
-  
-  let qrText = trimmed
-  
-  // 如果是网页地址，提取MAID并转换为SGWCMAID格式
-  if (isReqLink) {
-    try {
-      // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
-      // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
-      const match = trimmed.match(/qrcode\/req\/(MAID[^?\.]+)/i)
-      if (match && match[1]) {
-        const maid = match[1]
-        // 在前面加上 SGWC 变成 SGWCMAID...
-        qrText = 'SGWC' + maid
-      } else {
-        return null
-      }
-    } catch (error) {
-      return null
-    }
-  } else if (isImgLink) {
-    try {
-      // 从图片URL中提取MAID部分：https://wq.wahlap.net/qrcode/img/MAID260128205107...png?v
-      // 匹配 /qrcode/img/ 后面的 MAID 开头的内容（到 .png 或 ? 之前）
-      const match = trimmed.match(/qrcode\/img\/(MAID[^?\.]+)/i)
-      if (match && match[1]) {
-        const maid = match[1]
-        // 在前面加上 SGWC 变成 SGWCMAID...
-        qrText = 'SGWC' + maid
-      } else {
-        return null
-      }
-    } catch (error) {
-      return null
-    }
-  } else if (!isSGID) {
-    return null
-  }
-  
-  // 验证SGID格式和长度
-  if (!qrText.startsWith('SGWCMAID')) {
-    return null
-  }
-  
-  if (qrText.length < 48 || qrText.length > 128) {
-    return null
-  }
-  
-  return { qrText }
-}
-
-/**
  * 检查群是否在白名单中（如果白名单功能启用）
  */
 function checkWhitelist(session: Session | null, config: Config, debugBypass?: boolean): { allowed: boolean; message?: string } {
@@ -1339,8 +1298,13 @@ async function getBindRelatedLegacyUserIdsForTarget(
 
 async function getSessionBindingKeys(ctx: Context, session: Session): Promise<string[]> {
   const keys: string[] = []
+  const canonical = await getCanonicalV2UserId(session)
+  if (canonical) {
+    keys.push(canonical)
+  }
+
   const rawUserId = session.userId ? String(session.userId) : ''
-  if (rawUserId) {
+  if (rawUserId && !keys.includes(rawUserId)) {
     keys.push(rawUserId)
   }
 
@@ -1351,7 +1315,11 @@ async function getSessionBindingKeys(ctx: Context, session: Session): Promise<st
     if (unifiedId !== undefined && unifiedId !== null) {
       const unifiedKey = `koishi:${String(unifiedId)}`
       if (!keys.includes(unifiedKey)) {
-        keys.unshift(unifiedKey)
+        keys.push(unifiedKey)
+      }
+      const numericUnified = String(unifiedId)
+      if (/^\d+$/.test(numericUnified) && !keys.includes(numericUnified)) {
+        keys.unshift(numericUnified)
       }
     }
   } catch {
@@ -1459,6 +1427,57 @@ async function tryRecallMessage(
   } catch (error: any) {
     // 撤回失败时不抛出错误，只记录日志
     logger.debug(`尝试撤回消息失败（可能不支持该功能）: ${error?.message || '未知错误'}`)
+  }
+}
+
+/** 撤回 Bot 发送的消息（用于交互流程只保留结果） */
+async function recallBotMessages(
+  session: Session,
+  ctx: Context,
+  messageIds: string[],
+): Promise<void> {
+  if (!messageIds.length || !session.channelId) return
+  if (!(session.bot && typeof session.bot.deleteMessage === 'function')) return
+
+  const platform = String(session.platform || '').toLowerCase()
+  const delayMs = platform === 'kook' ? 500 : 200
+  if (delayMs > 0) {
+    await new Promise(resolve => setTimeout(resolve, delayMs))
+  }
+
+  for (const id of messageIds) {
+    if (!id) continue
+    try {
+      await session.bot.deleteMessage(session.channelId, id)
+    } catch {
+      ctx.logger('maibot').debug(`撤回 Bot 消息失败: ${id}`)
+    }
+  }
+}
+
+/** 发送临时消息并在 recall() 时撤回 */
+function createBotMessageTracker(session: Session, ctx: Context, enabled: boolean) {
+  const ids: string[] = []
+  return {
+    async send(content: string): Promise<void> {
+      if (!enabled) {
+        await session.send(content)
+        return
+      }
+      const result = await session.send(content)
+      if (typeof result === 'string' && result) {
+        ids.push(result)
+      } else if (Array.isArray(result)) {
+        for (const id of result) {
+          if (id && typeof id === 'string') ids.push(id)
+        }
+      }
+    },
+    async recall(): Promise<void> {
+      if (!enabled || ids.length === 0) return
+      await recallBotMessages(session, ctx, [...ids])
+      ids.length = 0
+    },
   }
 }
 
@@ -1591,19 +1610,22 @@ async function getQrText(
   // 缓存过期或没有缓存，直接问
   const actualTimeout = timeout
   const message = promptMessage || `请在${actualTimeout / 1000}秒内发送SGID（长按玩家二维码识别后发送）或公众号提供的网页地址`
+  const recallInteractive = config.autoRecallInteractiveMessages !== false
+  const tracker = createBotMessageTracker(session, ctx, recallInteractive)
   
   try {
-    await session.send(message)
+    await tracker.send(message)
     logger.info(`等待用户 ${session.userId} 输入 SGID/链接，超时: ${actualTimeout}ms`)
     
     const promptSession = await waitForUserReply(session, ctx, actualTimeout)
     const promptText = promptSession?.content?.trim() || ''
     if (!promptText) {
-      await session.send(`❌ 输入超时（${actualTimeout / 1000}秒）`)
+      await tracker.recall()
       return { qrText: '', error: '超时未收到响应' }
     }
 
     const trimmed = promptText.trim()
+    await tracker.recall()
     // 交互式输入的敏感信息，撤回用户输入消息
     if (promptSession) {
       await tryRecallMessage(promptSession, ctx, config, promptSession.messageId)
@@ -1678,23 +1700,24 @@ async function getQrText(
     // 尝试撤回用户发送的消息（如果启用了自动撤回）
     await tryRecallMessage(session, ctx, config)
     
-    await session.send('⏳ 正在处理，请稍候...')
+    const processingTracker = createBotMessageTracker(session, ctx, recallInteractive)
+    await processingTracker.send('⏳ 正在处理，请稍候...')
     
     // 验证qrCode是否有效
     try {
       const preview = await api.getPreview(config.machineInfo?.clientId ?? '', qrText)
       if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
-        await session.send('❌ 无效或过期的二维码，请重新发送')
+        await processingTracker.recall()
         return { qrText: '', error: '无效或过期的二维码' }
       }
       if (binding) {
         const vr = verifyPreviewMatchesBinding(binding, preview)
         const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
         if (hv.blocked) {
-          await session.send(hv.message)
+          await processingTracker.recall()
           return { qrText: '', error: hv.message }
         }
-        if (hv.migrationNotice) await session.send(hv.migrationNotice)
+        if (hv.migrationNotice && !recallInteractive) await session.send(hv.migrationNotice)
         const patch: Record<string, unknown> = {
           qrCode: qrText,
           lastQrCode: qrText,
@@ -1707,16 +1730,17 @@ async function getQrText(
         logger.info(`已更新用户 ${binding.userId} 的qrCode和缓存`)
       }
       
+      await processingTracker.recall()
       return { qrText: qrText }
     } catch (error: any) {
       logger.error(`验证qrCode失败: ${sanitizeError(error)}`)
-      await session.send(`❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`)
+      await processingTracker.recall()
       return { qrText: '', error: `验证二维码失败：${getSafeErrorMessage(error, session)}` }
     }
   } catch (error: any) {
     logger.error(`等待用户输入二维码失败: ${error?.message}`, error)
+    await tracker.recall()
     if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
-      await session.send(`❌ 输入超时（${actualTimeout / 1000}秒）`)
       return { qrText: '', error: '超时未收到响应' }
     }
     return { qrText: '', error: getSafeErrorMessage(error, session) }
@@ -1730,11 +1754,11 @@ function qrOrLoginFailureHint(): string {
 export function apply(ctx: Context, config: Config) {
   const apiModeResolved = config.apiMode ?? 'team'
   const isPublicApi = apiModeResolved === 'public'
+  const PUBLIC_API_UNAVAILABLE_MSG =
+    '⚠️ 新版本仍然在开发中，暂时不提供相关接口。\n具体请加入 AWMC QQ 群获取更多信息：1072033605'
   if (isPublicApi) {
     if (!config.publicGatewayToken?.trim()) {
-      throw new Error(
-        '[maibot] 公共 API（apiMode: public）须配置 publicGatewayToken。申请：https://api.awmc.team · 购买额度：https://store.awmc.team',
-      )
+      ctx.logger('maibot').warn('[maibot] 公共 API 模式：新版本开发中，接口暂未启用')
     }
   } else {
     if (!config.machineInfo?.clientId?.trim()) {
@@ -1847,9 +1871,9 @@ export function apply(ctx: Context, config: Config) {
     )
   }
 
-  // 初始化队列系统
-  const queueConfig = config.queue || { enabled: false, interval: 10000, message: '你正在排队，前面还有 {queuePosition} 人。预计等待 {queueEST} 秒。' }
-  const requestQueue = queueConfig.enabled ? new RequestQueue(queueConfig.interval) : null
+  // 初始化发票 Bot 侧队列（仅 /mai发票 使用）
+  const queueConfig = config.queue || { enabled: false, interval: 10000, message: '⏳ 发票排队中，前面还有 {queuePosition} 人，预计等待 {queueEST} 秒。' }
+  const chargeRequestQueue = queueConfig.enabled ? new RequestQueue(queueConfig.interval) : null
 
   // 操作记录配置
   const operationLogConfig = config.operationLog || { enabled: true, refIdLabel: 'Ref_ID' }
@@ -1912,131 +1936,169 @@ export function apply(ctx: Context, config: Config) {
     await recordCommandCooldown(ctx, uid, cmdName, priorityCooldownCfg, sessionMaiUid)
   })
 
+  const B50_COMMAND_MAPPING: Record<string, string> = {
+    'mai上传B50-任务完成': 'mai上传B50',
+    'mai上传B50-任务超时': 'mai上传B50',
+    'mai上传B50-轮询异常': 'mai上传B50',
+    'maiua-水鱼B50': 'mai上传B50',
+    'maiua-落雪B50': 'mai上传落雪b50',
+    'mai上传落雪b50-任务完成': 'mai上传落雪b50',
+    'mai上传落雪b50-任务超时': 'mai上传落雪b50',
+    'mai上传落雪b50-轮询异常': 'mai上传落雪b50',
+  }
+
+  function formatB50DurationSec(sec: number): string {
+    if (sec < 60) return `约 ${Math.max(1, Math.round(sec))} 秒`
+    const min = Math.floor(sec / 60)
+    const remainder = Math.round(sec % 60)
+    if (remainder === 0) return `约 ${min} 分钟`
+    return `约 ${min} 分 ${remainder} 秒`
+  }
+
+  interface B50UploadStatsData {
+    avgDurationSec: number
+    durationSamples: number
+    successCount: number
+    totalCount: number
+  }
+
+  /** 采集今日 B50 上传统计（同步 + 异步任务） */
+  async function collectB50UploadStats(commandPrefixes: string[]): Promise<B50UploadStatsData> {
+    const prefixSet = new Set(commandPrefixes)
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const todayStart = today.getTime()
+    const pollTimeoutSec = (config.b50PollTimeout ?? 600000) / 1000
+
+    const allLogs = await ctx.database.get('maibot_operation_logs', {})
+    const todayLogs = allLogs.filter(log => {
+      const logTime = new Date(log.createdAt).getTime()
+      if (logTime < todayStart) return false
+      const mapped = B50_COMMAND_MAPPING[log.command] || log.command
+      return prefixSet.has(mapped)
+    })
+
+    const allSubmitLogs = todayLogs.filter(log => {
+      const mapped = B50_COMMAND_MAPPING[log.command] || log.command
+      return prefixSet.has(mapped) && !log.command.includes('-任务')
+    })
+    const allCompleteLogs = todayLogs.filter(log =>
+      log.command.includes('-任务完成')
+      || log.command.includes('-任务超时')
+      || log.command.includes('-轮询异常'),
+    )
+    const successCompleteLogs = todayLogs.filter(log =>
+      log.command.includes('-任务完成') && log.status === 'success',
+    )
+
+    let durationSum = 0
+    let durationSamples = 0
+
+    for (const submitLog of allSubmitLogs.filter(log => log.status === 'success')) {
+      if (!submitLog.apiResponse) continue
+      try {
+        const response = JSON.parse(submitLog.apiResponse)
+        if (typeof response.elapsedMs === 'number' && response.elapsedMs > 0) {
+          const sec = response.elapsedMs / 1000
+          if (sec < pollTimeoutSec) {
+            durationSum += sec
+            durationSamples++
+          }
+          continue
+        }
+        const taskId = response.task_id
+        if (!taskId) continue
+        const completeLog = successCompleteLogs.find(log => {
+          if (!log.apiResponse) return false
+          try {
+            const completeResponse = JSON.parse(log.apiResponse)
+            return completeResponse.alive_task_id === taskId
+              || String(completeResponse.alive_task_id) === String(taskId)
+          } catch {
+            return false
+          }
+        })
+        if (completeLog) {
+          const duration = (new Date(completeLog.createdAt).getTime() - new Date(submitLog.createdAt).getTime()) / 1000
+          if (duration > 0 && duration < pollTimeoutSec) {
+            durationSum += duration
+            durationSamples++
+          }
+        }
+      } catch {
+        continue
+      }
+    }
+
+    const syncSubmitLogs = allSubmitLogs.filter(log => {
+      if (!log.apiResponse) return true
+      try {
+        const response = JSON.parse(log.apiResponse)
+        return response.sync === true || !response.task_id
+      } catch {
+        return true
+      }
+    })
+
+    let successCount = syncSubmitLogs.filter(log => log.status === 'success').length
+    let totalCount = syncSubmitLogs.length
+
+    for (const log of allSubmitLogs) {
+      if (syncSubmitLogs.includes(log)) continue
+      if (log.status !== 'success') {
+        totalCount++
+      }
+    }
+
+    totalCount += allCompleteLogs.length
+    successCount += successCompleteLogs.length
+
+    return {
+      avgDurationSec: durationSamples > 0 ? durationSum / durationSamples : 0,
+      durationSamples,
+      successCount,
+      totalCount,
+    }
+  }
+
+  async function getB50UploadStatsHint(commandPrefixes: string | string[]): Promise<{
+    estimatedFinishText?: string
+    successRateText?: string
+  }> {
+    try {
+      const prefixes = Array.isArray(commandPrefixes) ? commandPrefixes : [commandPrefixes]
+      const stats = await collectB50UploadStats(prefixes)
+      const hint: { estimatedFinishText?: string; successRateText?: string } = {}
+      if (stats.durationSamples > 0 && stats.avgDurationSec > 0) {
+        hint.estimatedFinishText = formatB50DurationSec(stats.avgDurationSec)
+      }
+      if (stats.totalCount > 0) {
+        hint.successRateText = `${((stats.successCount / stats.totalCount) * 100).toFixed(1)}%`
+      }
+      return hint
+    } catch (error) {
+      logger.warn(`获取 B50 统计提示失败: ${sanitizeError(error)}`)
+      return {}
+    }
+  }
+
   /**
-   * 获取上传任务的统计信息（平均处理时长和今日成功率）
-   * @param commandPrefix 命令前缀，用于筛选日志（如 'mai上传B50' 或 'mai上传落雪b50'）
-   * @param showDetails 是否显示详细数量（用于管理员统计）
-   * @returns 统计信息字符串
+   * 获取上传任务的统计信息（管理员统计用）
    */
   async function getUploadStats(commandPrefix: string, showDetails: boolean = false): Promise<string> {
     try {
-      const today = new Date()
-      today.setHours(0, 0, 0, 0)
-      const todayStart = today.getTime()
-
-      // 命令名称映射（与管理员统计保持一致）
-      const commandMapping: Record<string, string> = {
-        'mai上传B50-任务完成': 'mai上传B50',
-        'mai上传B50-任务超时': 'mai上传B50',
-        'mai上传B50-轮询异常': 'mai上传B50',
-        'mai上传落雪b50-任务完成': 'mai上传落雪b50',
-        'mai上传落雪b50-任务超时': 'mai上传落雪b50',
-        'mai上传落雪b50-轮询异常': 'mai上传落雪b50',
+      const stats = await collectB50UploadStats([commandPrefix])
+      const parts: string[] = []
+      if (stats.durationSamples > 0 && stats.avgDurationSec > 0) {
+        parts.push(`平均处理用时 ${stats.avgDurationSec.toFixed(1)} s`)
       }
-
-      // 获取今日所有相关操作记录（使用映射后的命令名称）
-      const allLogs = await ctx.database.get('maibot_operation_logs', {})
-      const todayLogs = allLogs.filter(log => {
-        const logTime = new Date(log.createdAt).getTime()
-        if (logTime < todayStart) return false
-        // 使用映射后的命令名称进行匹配
-        const mappedCommand = commandMapping[log.command] || log.command
-        return mappedCommand === commandPrefix
-      })
-
-      if (todayLogs.length === 0) {
-        return ''
+      if (stats.totalCount > 0) {
+        const rate = ((stats.successCount / stats.totalCount) * 100).toFixed(1)
+        parts.push(showDetails
+          ? `成功率 ${rate}% (${stats.successCount}/${stats.totalCount})`
+          : `成功率 ${rate}%`)
       }
-
-      // 获取所有任务提交记录（包括成功和失败的提交）
-      const allSubmitLogs = todayLogs.filter(log => log.command === commandPrefix)
-      
-      // 获取所有任务完成记录（成功完成、超时、轮询异常）
-      const allCompleteLogs = todayLogs.filter(log => 
-        log.command.includes('-任务完成') || 
-        log.command.includes('-任务超时') || 
-        log.command.includes('-轮询异常')
-      )
-      
-      // 获取所有成功的任务完成记录
-      const successCompleteLogs = todayLogs.filter(log => 
-        log.command.includes('-任务完成') && log.status === 'success'
-      )
-      
-      // 计算平均处理时长（只统计成功完成的任务，排除错误请求）
-      let avgDuration = 0
-      let durationCount = 0
-      
-      // 获取所有成功的任务提交记录（用于计算处理时长）
-      const successSubmitLogs = allSubmitLogs.filter(log => log.status === 'success')
-      
-      for (const submitLog of successSubmitLogs) {
-        // 尝试从 apiResponse 中获取 task_id
-        if (!submitLog.apiResponse) continue
-        try {
-          const response = JSON.parse(submitLog.apiResponse)
-          const taskId = response.task_id
-          if (!taskId) continue
-          
-          // 查找对应的成功完成记录
-          const completeLog = successCompleteLogs.find(log => {
-            if (!log.apiResponse) return false
-            try {
-              const completeResponse = JSON.parse(log.apiResponse)
-              return completeResponse.alive_task_id === taskId || String(completeResponse.alive_task_id) === String(taskId)
-            } catch {
-              return false
-            }
-          })
-          
-          if (completeLog) {
-            const submitTime = new Date(submitLog.createdAt).getTime()
-            const completeTime = new Date(completeLog.createdAt).getTime()
-            const duration = (completeTime - submitTime) / 1000 // 转换为秒
-            const pollTimeout = config.b50PollTimeout ?? 600000
-            const maxDuration = pollTimeout / 1000  // 使用配置的超时时间作为最大值
-            if (duration > 0 && duration < maxDuration) {
-              avgDuration += duration
-              durationCount++
-            }
-          }
-        } catch {
-          continue
-        }
-      }
-      
-      // 计算平均时长
-      if (durationCount > 0) {
-        avgDuration = avgDuration / durationCount
-      }
-      
-      // 统计成功率 - 基于已完成的任务（有完成记录的任务）
-      // 总数 = 有完成记录的任务数（成功完成 + 超时 + 轮询异常）
-      // 成功数 = 成功完成的任务数
-      const totalCount = allCompleteLogs.length
-      const successCount = successCompleteLogs.length
-      
-      // 计算成功率（成功完成数 / 已完成总数）
-      const successRate = totalCount > 0 ? ((successCount / totalCount) * 100).toFixed(1) : '0.0'
-      
-      // 构建统计信息字符串
-      let statsStr = ''
-      // 只有当有成功完成的任务配对时才显示平均处理用时
-      if (durationCount > 0 && avgDuration > 0) {
-        statsStr += `平均处理用时 ${avgDuration.toFixed(1)} s`
-      }
-      if (totalCount > 0) {
-        if (statsStr) statsStr += '，'
-        // 统一使用 "成功率 xx.x%" 格式（与管理员统计一致）
-        // showDetails 控制是否显示详细数量 (xx/xx)
-        if (showDetails) {
-          statsStr += `成功率 ${successRate}% (${successCount}/${totalCount})`
-        } else {
-          statsStr += `成功率 ${successRate}%`
-        }
-      }
-      
-      return statsStr
+      return parts.join('，')
     } catch (error) {
       logger.warn(`获取上传统计信息失败: ${sanitizeError(error)}`)
       return ''
@@ -2131,72 +2193,88 @@ export function apply(ctx: Context, config: Config) {
   }
 
   /**
-   * 在API调用前加入队列并等待
-   * 这个函数应该在获取到SGID后、调用API前使用
-   * @returns 返回发送的消息ID数组（用于后续撤回）
+   * 发送处理中提示（可撤回）
    */
-  async function waitForQueue(session: Session): Promise<string[]> {
+  async function sendProcessingNotice(session: Session, message: string): Promise<string[]> {
+    try {
+      return await sendAndGetMessageIds(session, message)
+    } catch (err) {
+      logger.warn('发送处理中提示失败:', err)
+      return []
+    }
+  }
+
+  async function buildB50ProcessingMessage(commandPrefixes: string | string[]): Promise<string> {
+    const lines = ['⏳ 正在上传 B50，预计 0-2 分钟，请勿重复提交。']
+    const hint = await getB50UploadStatsHint(commandPrefixes)
+    if (hint.estimatedFinishText) {
+      lines.push(`预计完成时间：${hint.estimatedFinishText}`)
+    }
+    if (hint.successRateText) {
+      lines.push(`成功率：${hint.successRateText}`)
+    }
+    return lines.join('\n')
+  }
+
+  /** B50 上传前发送一次处理提示（含可选统计行） */
+  async function sendB50ProcessingNotice(session: Session, commandPrefixes: string | string[]): Promise<string[]> {
+    return sendProcessingNotice(session, await buildB50ProcessingMessage(commandPrefixes))
+  }
+
+  /**
+   * /mai发票 调用前：Bot 侧发票队列限流
+   */
+  async function waitForChargeQueue(session: Session): Promise<string[]> {
     const sentMessageIds: string[] = []
-    
-    if (!requestQueue) {
-      // 队列未启用，直接返回空数组
+
+    if (!chargeRequestQueue) {
       return sentMessageIds
     }
 
-    // 调试群跳过队列
     if (isDebugSession(session)) {
-      debugLog(session, '跳过队列（调试群）')
+      debugLog(session, '跳过发票队列（调试群）')
       return sentMessageIds
     }
 
-    // 检查必要的 session 属性
     if (!session.userId || !session.channelId) {
-      logger.warn('无法加入队列：缺少 userId 或 channelId')
+      logger.warn('无法加入发票队列：缺少 userId 或 channelId')
       return sentMessageIds
     }
 
-    // 先获取当前队列位置（不等待）
-    const currentQueueLength = requestQueue.getQueuePosition()
-    const isProcessing = requestQueue.isProcessing()
-    const timeSinceLastProcess = Date.now() - requestQueue.getLastProcessTime()
+    const currentQueueLength = chargeRequestQueue.getQueuePosition()
+    const isProcessing = chargeRequestQueue.isProcessing()
+    const timeSinceLastProcess = Date.now() - chargeRequestQueue.getLastProcessTime()
     const needsQueue = currentQueueLength > 0 ||
       isProcessing ||
-      timeSinceLastProcess < requestQueue.getInterval()
-    
-    // 无论是否需要排队，都发送队列信息（确保用户能看到状态）
+      timeSinceLastProcess < chargeRequestQueue.getInterval()
+
     if (needsQueue) {
-      // 需要排队：计算队列位置（当前队列长度 + 1，因为用户即将加入）
       const queuePosition = currentQueueLength + 1
-      // 计算预计等待时间（考虑下一次可处理的剩余时间）
-      const estimatedWait = requestQueue.getEstimatedWaitTimeForPosition(queuePosition)
+      const estimatedWait = chargeRequestQueue.getEstimatedWaitTimeForPosition(queuePosition)
       const queueMessage = queueConfig.message
         .replace(/{queuePosition}/g, String(queuePosition))
         .replace(/{queueEST}/g, String(estimatedWait))
-      // 立即发送队列提示消息（等待发送完成，确保消息及时送达）
       try {
         const msgIds = await sendAndGetMessageIds(session, queueMessage)
         sentMessageIds.push(...msgIds)
       } catch (err) {
-        logger.warn('发送队列提示消息失败:', err)
+        logger.warn('发送发票队列提示失败:', err)
       }
     } else {
-      // 不需要排队：发送"正在处理"的消息
       try {
-        const msgIds = await sendAndGetMessageIds(session, '⏳ 正在处理您的请求，请稍候...')
+        const msgIds = await sendAndGetMessageIds(session, '⏳ 正在提交发票充值任务…')
         sentMessageIds.push(...msgIds)
       } catch (err) {
-        logger.warn('发送处理中消息失败:', err)
+        logger.warn('发送发票处理提示失败:', err)
       }
     }
 
-    // 加入队列并等待处理
-    // 注意：即使发送了队列消息，这里仍然会等待队列处理完成
     try {
-      await requestQueue.enqueue(session.userId, session.channelId)
+      await chargeRequestQueue.enqueue(session.userId, session.channelId)
     } catch (error: any) {
-      logger.warn(`加入队列失败: ${error?.message || '未知错误'}`)
+      logger.warn(`加入发票队列失败: ${error?.message || '未知错误'}`)
     }
-    
+
     return sentMessageIds
   }
 
@@ -2207,8 +2285,8 @@ export function apply(ctx: Context, config: Config) {
   ctx.on('dispose', () => {
     isPluginActive = false
     logger.info('插件已停止，将不再执行新的定时任务')
-    if (requestQueue) {
-      requestQueue.close('插件已停止，队列已关闭')
+    if (chargeRequestQueue) {
+      chargeRequestQueue.close('插件已停止，发票队列已关闭')
     }
   })
 
@@ -2276,6 +2354,13 @@ export function apply(ctx: Context, config: Config) {
   const maintenanceNotice = config.maintenanceNotice
   const confirmTimeout = config.confirmTimeout ?? 10000
   const rebindTimeout = config.rebindTimeout ?? 60000  // 默认60秒
+  const termsPolicy = config.termsPolicy ?? {
+    url: 'https://wiki.awmc.cc/guide/bot/terms',
+    acceptText:
+      '我已认真阅读网页中的服务说明，并已了解AWMC服务可能带来的风险。我了解因使用本服务，造成舞萌DX官方账号遭到封禁，责任和AWMC无关。我确认发送二维码可能会对我的账号产生安全影响，并愿意接受这样的风险。在阅读说明后，我同意上述协议。',
+    version: '2.0.0',
+  }
+  const autoRecallInteractive = config.autoRecallInteractiveMessages !== false
   const authLevelForProxy = config.authLevelForProxy ?? 3
   const protectionLockMessage = config.protectionLockMessage ?? '🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功'
   const maintenanceMode = config.maintenanceMode ?? false
@@ -2374,11 +2459,14 @@ export function apply(ctx: Context, config: Config) {
   // 创建使用配置的 promptYes 函数
   const promptYesWithConfig = async (session: Session, message: string, timeout?: number): Promise<boolean> => {
     const actualTimeout = timeout ?? confirmTimeout
-    await session.send(`${message}\n在${actualTimeout / 1000}秒内输入 Y 确认，其它输入取消`)
+    const tracker = createBotMessageTracker(session, ctx, autoRecallInteractive)
+    await tracker.send(`${message}\n在${actualTimeout / 1000}秒内输入 Y 确认，其它输入取消`)
     try {
       const answer = await session.prompt(actualTimeout)
+      await tracker.recall()
       return answer?.trim().toUpperCase() === 'Y'
     } catch {
+      await tracker.recall()
       return false
     }
   }
@@ -2420,67 +2508,188 @@ export function apply(ctx: Context, config: Config) {
     return next()
   }, true) // 设置为 true 使其在早期执行，但不影响普通消息
 
-  // 免责声明常量
-  const TERMS_DISCLAIMER = `⚠️ 本BOT提供的部分服务（如发票、上传B50等）可能会对您的舞萌账户造成不良影响，您需悉知。\nAWMC TEAM不对用户使用上述服务可能造成的不良后果负责。`
-  const TERMS_ACCEPT_TEXT = '我已阅读并了解以上风险并接受使用本工具可能造成的不良后果'
+  const TERMS_ACCEPT_TEXT = termsPolicy.acceptText
+  const TERMS_VERSION = termsPolicy.version || '2.0.0'
 
   async function hasAcceptedTerms(userId: string): Promise<boolean> {
     if (!userId) return false
     const rows = await ctx.database.get('maibot_user_terms', { userId })
-    return rows.length > 0
+    if (rows.length === 0) return false
+    const row = rows[0]
+    const acceptedVersion = row.termsVersion || '1.0.0'
+    return acceptedVersion === TERMS_VERSION
   }
 
   async function saveTermsAccepted(userId: string): Promise<void> {
     const existing = await ctx.database.get('maibot_user_terms', { userId })
     if (existing.length === 0) {
-      await ctx.database.create('maibot_user_terms', { userId, acceptedAt: new Date() })
+      await ctx.database.create('maibot_user_terms', {
+        userId,
+        acceptedAt: new Date(),
+        termsVersion: TERMS_VERSION,
+      })
+    } else {
+      await ctx.database.set('maibot_user_terms', { userId }, {
+        acceptedAt: new Date(),
+        termsVersion: TERMS_VERSION,
+      })
     }
   }
 
-  // 免责声明中间件：拦截所有 mai 开头的命令，要求用户先接受免责声明
+  async function clearTermsAccepted(userId: string): Promise<void> {
+    if (!userId) return
+    await ctx.database.remove('maibot_user_terms', { userId })
+  }
+
+  /** V2 数据迁移中间件：老用户需确认迁移，拒绝则无法继续使用 */
   ctx.middleware(async (session, next) => {
     const content = session.content?.trim() || ''
-    // 匹配所有 mai 开头的命令
     if (!content.match(/^\/?mai/i)) {
       return next()
     }
 
-    // 调试群跳过免责声明
     if (isDebugSession(session)) {
       return next()
     }
 
-    // 排除不需要声明的指令（帮助、绑定、ping、queue、alert）
     const baseCmd = content.replace(/^\//, '').split(/\s+/)[0] || ''
-    const termsExempt = new Set(['mai', 'mai帮助', 'maiping', 'maiqueue', 'maialert', 'mai兑换卡密'])
-    if (termsExempt.has(baseCmd) || baseCmd.startsWith('maialert') || baseCmd.startsWith('mai管理员') || baseCmd === 'maibypass') {
+    if (baseCmd === 'mai' || baseCmd === 'mai帮助' || baseCmd === 'maiping' || baseCmd === 'maiSGID获取' || baseCmd === 'SGID获取') {
       return next()
     }
 
     const keys = await getSessionBindingKeys(ctx, session)
-    const primaryUserId = keys[0] || String(session.userId || '')
+    const canonicalUserId = await getCanonicalV2UserId(session)
+    if (!canonicalUserId) {
+      return next()
+    }
+
+    const migrationTargetId = isV2UserIdFormat(canonicalUserId)
+      ? canonicalUserId
+      : keys.find(k => isV2UserIdFormat(k)) || canonicalUserId
+
+    if (await hasCompletedV2Migration(ctx, migrationTargetId)) {
+      return next()
+    }
+
+    const legacyData = await hasAnyMaibotUserData(ctx, keys)
+    if (!legacyData) {
+      await markV2MigrationComplete(ctx, migrationTargetId)
+      return next()
+    }
+
+    const tracker = createBotMessageTracker(session, ctx, autoRecallInteractive)
+    await tracker.send(V2_MIGRATION_PROMPT)
+
+    try {
+      const reply = await session.prompt(60000)
+      await tracker.recall()
+      const decision = parseMigrationConfirm(reply)
+      if (decision === 'no') {
+        return '❌ 您已取消数据迁移，无法继续使用 maiBot V2。如需使用请重新发起指令并选择【是】。'
+      }
+      if (decision !== 'yes') {
+        return '❌ 请输入【是】或【否】以确认是否迁移数据'
+      }
+
+      await tracker.send(V2_MIGRATION_CONFIRM_PROMPT)
+      const confirmReply = await session.prompt(60000)
+      await tracker.recall()
+      const confirmDecision = parseMigrationConfirm(confirmReply)
+      if (confirmDecision === 'no') {
+        return '❌ 您已取消数据迁移，无法继续使用 maiBot V2。如需使用请重新发起指令并选择【是】。'
+      }
+      if (confirmDecision !== 'yes') {
+        return '❌ 请输入【是】或【否】以确认是否同意变更并完成迁移'
+      }
+
+      if (isV2UserIdFormat(migrationTargetId)) {
+        await performV2UserMigration(ctx, migrationTargetId, keys)
+      } else {
+        await ctx.database.remove('maibot_user_terms', { userId: migrationTargetId })
+        await clearLegacyLxnsBinding(ctx, migrationTargetId)
+        await markV2MigrationComplete(ctx, migrationTargetId)
+      }
+      return '✅ 数据已迁移至 maiBot V2。落雪好友码绑定已清除，请使用落雪 Token 重新绑定。请重新确认用户协议后再使用其他功能。'
+    } catch {
+      await tracker.recall()
+      return '❌ 迁移确认超时，操作已取消'
+    }
+  }, true)
+
+  /** public 模式：接口暂未开放，仅允许帮助/卡密/管理员等本地指令 */
+  ctx.middleware(async (session, next) => {
+    if (!isPublicApi) return next()
+    const content = session.content?.trim() || ''
+    if (!content.match(/^\/?mai/i)) return next()
+    if (isDebugSession(session)) return next()
+
+    const baseCmd = content.replace(/^\//, '').split(/\s+/)[0] || ''
+    const publicApiExempt = new Set([
+      'mai', 'mai帮助', 'maialert', 'mai兑换卡密', 'maiSGID获取', 'SGID获取',
+    ])
+    if (
+      publicApiExempt.has(baseCmd)
+      || baseCmd.startsWith('maialert')
+      || baseCmd.startsWith('mai管理员')
+      || baseCmd === 'maibypass'
+    ) {
+      return next()
+    }
+    return PUBLIC_API_UNAVAILABLE_MSG
+  }, true)
+
+  // 用户协议中间件：拦截 mai 指令，要求用户浏览协议页并输入确认词
+  ctx.middleware(async (session, next) => {
+    const content = session.content?.trim() || ''
+    if (!content.match(/^\/?mai/i)) {
+      return next()
+    }
+
+    if (isDebugSession(session)) {
+      return next()
+    }
+
+    const baseCmd = content.replace(/^\//, '').split(/\s+/)[0] || ''
+    const termsExempt = new Set(['mai', 'mai帮助', 'maiping', 'maiqueue', 'maialert', 'mai兑换卡密', 'maiSGID获取', 'SGID获取'])
+    if (termsExempt.has(baseCmd) || baseCmd.startsWith('maialert') || baseCmd.startsWith('mai管理员') || baseCmd === 'maibypass') {
+      return next()
+    }
+
+    const canonicalUserId = await getCanonicalV2UserId(session)
+    const keys = await getSessionBindingKeys(ctx, session)
+    const primaryUserId = canonicalUserId || keys[0] || String(session.userId || '')
     if (!primaryUserId) {
       return next()
     }
 
-    // 已接受过，放行
+    if (!(await hasCompletedV2Migration(ctx, primaryUserId))) {
+      return next()
+    }
+
     if (await hasAcceptedTerms(primaryUserId)) {
       return next()
     }
 
-    // 未接受：显示免责声明，等待用户输入确认文本
-    await session.send(`${TERMS_DISCLAIMER}\n\n请在 60 秒内输入以下内容以继续使用：\n${TERMS_ACCEPT_TEXT}`)
+    const tracker = createBotMessageTracker(session, ctx, autoRecallInteractive)
+    await tracker.send(
+      '📋 使用前请先阅读AWMC项目maiBot的服务协议：\n' +
+      'https://wiki.awmc.cc/guide/bot/terms\n' +
+      'https://wiki.awmc.team/guide/bot/terms\n\n\n' +
+      '请打开上述链接，阅读网页中的服务说明后，在 60 秒内完整输入网页中的提示词来确认。\n' +
+      '请仔细阅读。',
+    )
 
     try {
       const reply = await session.prompt(60000)
+      await tracker.recall()
       const replyText = (reply || '').trim()
       if (replyText === TERMS_ACCEPT_TEXT) {
         await saveTermsAccepted(primaryUserId)
-        await session.send('✅ 已确认，正在处理您的请求...')
         return next()
       }
-      return '❌ 未输入正确的确认内容，操作已取消'
+      return '❌ 未输入正确的提示词，操作已取消'
     } catch {
+      await tracker.recall()
       return '❌ 确认超时，操作已取消'
     }
   }, true)
@@ -2638,7 +2847,31 @@ export function apply(ctx: Context, config: Config) {
     return { binding: bindings[0], isProxy: true, error: null }
   }
 
+  async function recallBotMessages(session: Session, messageIds: string[] | undefined): Promise<void> {
+    if (!messageIds?.length || !session.bot || !session.channelId) return
+    for (const msgId of messageIds) {
+      try {
+        await session.bot.deleteMessage(session.channelId, msgId)
+      } catch {
+        // 忽略撤回失败
+      }
+    }
+  }
+
+  function formatB50UploadSuccessMessage(
+    result: { sync?: boolean; task_id?: string; count?: number },
+    opts: { prefix?: string } = {},
+  ): string {
+    const prefix = opts.prefix ?? ''
+    if (isSyncB50Upload(result)) {
+      const countPart = result.count != null ? `，共 ${result.count} 首乐曲` : ''
+      return `${prefix}✅ B50 上传完成${countPart}`
+    }
+    return `${prefix}✅ B50 已提交，完成后将通知您`
+  }
+
   const scheduleB50Notification = (session: Session, taskId: string, initialRefId?: string, messagesToRecall?: string[]) => {
+    if (!taskId) return
     const bot = session.bot
     const channelId = session.channelId
     if (!bot || !channelId) {
@@ -2773,6 +3006,7 @@ export function apply(ctx: Context, config: Config) {
   }
 
   const scheduleLxB50Notification = (session: Session, taskId: string, initialRefId?: string, messagesToRecall?: string[]) => {
+    if (!taskId) return
     const bot = session.bot
     const channelId = session.channelId
     if (!bot || !channelId) {
@@ -2936,7 +3170,8 @@ export function apply(ctx: Context, config: Config) {
   /mai解绑 - 解绑舞萌DX账号
   /mai状态 - 查询绑定状态
   /mymai - 与 /mai状态 相同（别名）
-  /maiping - 测试机台连接`
+  /maiping - 测试机台连接
+  /maiqueue - 查询发票充值队列状态`
 
       // 有权限的代操作命令
       if (canProxy) {
@@ -2947,10 +3182,10 @@ export function apply(ctx: Context, config: Config) {
       helpText += `
 
 🐟 水鱼B50：
-  /mai绑定水鱼 <token> - 绑定水鱼Token用于B50上传
+  /mai绑定水鱼 <token> - 绑定水鱼Token
   /mai解绑水鱼 - 解绑水鱼Token
-  /mai上传B50 - 上传B50数据到水鱼
-  /maiua - 同时上传B50到水鱼和落雪（SGID只需一次）`
+  /mai上传B50 - 上传B50到水鱼
+  /maiua - 同时上传B50到水鱼和落雪`
 
       if (canProxy) {
         helpText += `
@@ -2963,9 +3198,9 @@ export function apply(ctx: Context, config: Config) {
       helpText += `
 
 ❄️ 落雪B50：
-  /mai绑定落雪 <lxns_code> - 绑定落雪代码用于B50上传
-  /mai解绑落雪 - 解绑落雪代码
-  /mai上传落雪b50 [lxns_code] - 上传B50数据到落雪`
+  /mai绑定落雪 <token> - 绑定落雪Token
+  /mai解绑落雪 - 解绑落雪Token
+  /mai上传落雪b50 - 上传B50到落雪`
 
       if (canProxy) {
         helpText += `
@@ -2980,7 +3215,7 @@ export function apply(ctx: Context, config: Config) {
       if (showAdvanced && !isPublicApi) {
           helpText += `
 
-🎫 票券管理：
+🎫 票券管理（异步入队，走充值队列，约 2–3 分钟）：
   /mai发票 [倍数] - 为账号发放功能票（2-6倍，默认2倍）
   /mai清票 - 清空账号的所有功能票`
 
@@ -3083,7 +3318,9 @@ export function apply(ctx: Context, config: Config) {
   /mai管理员取消个人优先 <@或ID> — 清除个人优先记录
   /mai管理员设置个人优先 <@或ID> <spec> — spec：永久、7d、clear 等
   /mai管理员设置群组优先 <spec> [-g 群标识] — spec 与 -g 可同一段输入（如 clear -g qq:群号）；纯数字 -g 会按当前平台补前缀；-g 省略且在群内则当前群
-  /maibypass <@用户|用户ID> — 清除该用户当前全部指令冷却（别名 /mai管理员清除冷却）`
+  /maibypass <@用户|用户ID> — 清除该用户当前全部指令冷却（别名 /mai管理员清除冷却）
+  /mai管理员重置用户协议 [all|@或ID] — 清除协议确认；all 重置全部用户（需二次确认）
+  /maiSGID获取 [文本|链接] — 调试 SGID 提取（auth≥3 或调试群；可交互发送文本/图片）`
       }
 
       helpText += `
@@ -3106,7 +3343,7 @@ export function apply(ctx: Context, config: Config) {
       if (isPublicApi) {
         helpText += `
 
-ℹ️ 当前为公共 API 模式：详情调用请前往 https://wiki.awmc.team/dev/awmc-api 。官方交流群1072033605。`
+ℹ️ ${PUBLIC_API_UNAVAILABLE_MSG}`
       }
 
       return helpText
@@ -3129,11 +3366,15 @@ export function apply(ctx: Context, config: Config) {
       }
 
       try {
-        await session.send('⏳ 正在测试机台连接...')
+        const tracker = createBotMessageTracker(session, ctx, autoRecallInteractive)
+        await tracker.send('⏳ 正在测试机台连接...')
         const result = await api.maiPing()
+        await tracker.recall()
         
-        // 检查返回结果是否为 {"result":"Pong"}
-        if (result.result === 'Pong') {
+        // 检查返回结果是否为 {"result":"Pong"} 或 sw-api health
+        if (result.status === 'ok') {
+          return `✅ 机台连接正常\n\n📊 查看所有服务状态: https://status.awmc.team`
+        } else if (result.result === 'Pong') {
           return `✅ 机台连接正常\n\n📊 查看所有服务状态: https://status.awmc.team`
         } else if (result.returnCode === 1 && result.serverTime) {
           const serverTime = new Date(result.serverTime * 1000).toLocaleString('zh-CN')
@@ -3154,43 +3395,61 @@ export function apply(ctx: Context, config: Config) {
 
 // 这个 Fracture_Hikaritsu 不给我吃KFC，故挂在此处。 我很生气。
   /**
-   * 查询队列位置
+   * 查询发票充值队列状态
    * 用法: /maiqueue
    */
-  ctx.command('maiqueue', '查询当前队列位置')
+  ctx.command('maiqueue', '查询发票充值队列状态')
     .action(async ({ session }) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      // 检查白名单
       const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
       if (!whitelistCheck.allowed) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
-      // 检查队列是否启用
-      if (!requestQueue) {
-        return 'ℹ️ 队列系统未启用'
+      if (!isPublicApi) {
+        try {
+          const q = await api.getChargeQueue()
+          if (q.code !== 0) {
+            return '❌ 查询服务端发票队列失败'
+          }
+          const pending = q.tasks.filter(t => t.status === 'pending').length
+          const processing = q.tasks.filter(t => t.status === 'processing').length
+          const failed = q.tasks.filter(t => t.status === 'failed').length
+          let msg = `📋 发票充值队列（服务端）\nWorker 数: ${q.workers}\n排队中: ${pending} · 处理中: ${processing}`
+          if (failed > 0) msg += ` · 最近失败: ${failed}`
+          if (pending + processing === 0) {
+            msg += '\n当前无等待中的充值任务'
+          } else {
+            msg += '\n\n说明：B50 上传为同步处理，不走此队列；仅 /mai发票 使用充值队列。'
+          }
+          return msg
+        } catch (error: any) {
+          return `❌ 查询发票队列失败: ${getSafeErrorMessage(error, session)}`
+        }
       }
 
-      // 检查必要的 session 属性
+      if (!chargeRequestQueue) {
+        return 'ℹ️ 公共 API 模式下发票为同步处理，无服务端充值队列。\n如需 Bot 侧限流，可在配置中开启 queue.enabled。'
+      }
+
       if (!session.userId || !session.channelId) {
         return '❌ 无法查询队列：缺少用户信息'
       }
 
-      // 查询用户在队列中的位置
-      const position = requestQueue.getUserQueuePosition(session.userId, session.channelId)
-      const estimatedWait = requestQueue.getUserEstimatedWaitTime(session.userId, session.channelId)
-      const totalQueue = requestQueue.getQueuePosition()
+      const position = chargeRequestQueue.getUserQueuePosition(session.userId, session.channelId)
+      const estimatedWait = chargeRequestQueue.getUserEstimatedWaitTime(session.userId, session.channelId)
+      const totalQueue = chargeRequestQueue.getQueuePosition()
 
       if (position < 0) {
-        return `ℹ️ 您当前不在队列中\n队列总长度: ${totalQueue}`
-      } else if (position === 0) {
-        return `✅ 您的请求正在处理中\n队列总长度: ${totalQueue}`
-      } else {
-        return `⏳ 您当前在队列中的位置: 第 ${position} 位\n预计等待时间: ${estimatedWait} 秒\n队列总长度: ${totalQueue}`
+        return `ℹ️ 您当前不在 Bot 发票队列中\n队列总长度: ${totalQueue}\n\n说明：B50 上传不走队列。`
       }
+      if (position === 0) {
+        return `✅ 您的发票请求正在 Bot 侧处理中\n队列总长度: ${totalQueue}`
+      }
+      return `⏳ 您在 Bot 发票队列中排第 ${position} 位\n预计等待: ${estimatedWait} 秒\n队列总长度: ${totalQueue}`
     })
 
   /**
@@ -3211,7 +3470,7 @@ export function apply(ctx: Context, config: Config) {
 
       // 使用队列系统
       const userBindingKeys = await getSessionBindingKeys(ctx, session)
-      const userId = userBindingKeys[0] || String(session.userId)
+      const userId = await getCanonicalV2UserId(session) || userBindingKeys[0] || String(session.userId)
 
       try {
         // 检查是否已绑定
@@ -3359,9 +3618,6 @@ export function apply(ctx: Context, config: Config) {
           // 如果已经是SGWCMAID格式，说明可能是直接参数传入的，尝试撤回
           await tryRecallMessage(session, ctx, config)
         }
-
-        // 在调用API前加入队列
-        await waitForQueue(session)
 
         // 使用新API获取用户信息（team 模式需 client_id；public 网关仅 qr_text）
         let previewResult
@@ -3617,11 +3873,8 @@ export function apply(ctx: Context, config: Config) {
           if (qrTextResult.error) {
             statusInfo += `\n⚠️ 无法获取最新状态：${qrTextResult.error}`
           } else {
-            // 在调用API前加入队列（只调用一次）
-            await waitForQueue(session)
-            
+            // 同时获取 preview 和 getCharge（并行执行）
             try {
-              // 同时获取 preview 和 getCharge（并行执行，避免重复排队）
               const [preview, chargeResult] = await Promise.all([
                 api.getPreview(machineInfo?.clientId ?? '', qrTextResult.qrText),
                 api.getCharge(
@@ -3744,8 +3997,7 @@ export function apply(ctx: Context, config: Config) {
               // 已经在上面并行获取了，直接使用
               chargeResult = (qrTextResultForCharge as any).chargeResult
             } else {
-              // 如果上面获取失败，这里重新获取（需要排队）
-              await waitForQueue(session)
+              // 如果上面获取失败，这里重新获取
               chargeResult = await api.getCharge(
                 machineInfo.regionId,
                 machineInfo.clientId,
@@ -4329,10 +4581,15 @@ export function apply(ctx: Context, config: Config) {
           maiUid: maskUserId(binding.maiUid),
         })
 
-        // 在调用API前加入队列
-        await waitForQueue(session)
+        // Bot 侧发票队列限流（可选）
+        await waitForChargeQueue(session)
 
-        await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
+        if (isPublicApi) {
+          await session.send('⏳ 正在发放发票，请等待服务器响应（通常 2–3 分钟）…')
+        } else if (!chargeRequestQueue) {
+          await session.send('⏳ 正在提交发票充值任务…')
+        }
+
         debugLog(session, 'mai发票 / 准备调用 getTicket', {
           regionId: isPublicApi ? undefined : machineInfo.regionId,
           clientId: isPublicApi ? undefined : machineInfo.clientId,
@@ -4368,8 +4625,7 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
-            // 在调用API前加入队列
-            await waitForQueue(session)
+            await waitForChargeQueue(session)
             ticketResult = await api.getTicket(
               isPublicApi ? undefined : machineInfo.regionId,
               isPublicApi ? undefined : machineInfo.clientId,
@@ -4398,8 +4654,7 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
-            // 在调用API前加入队列
-            await waitForQueue(session)
+            await waitForChargeQueue(session)
             ticketResult = await api.getTicket(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -4422,7 +4677,9 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        const successMessage = `✅ 已发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
+        const successMessage = isPublicApi
+          ? `✅ 已发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
+          : `✅ ${multiple} 倍发票已加入充值队列${ticketResult.queueMsg ? `\n${ticketResult.queueMsg}` : ''}\n后台处理约需 2–3 分钟，请在游戏内确认到账`
         const refId = await logOperation({
           command: 'mai发票',
           session,
@@ -4629,10 +4886,8 @@ export function apply(ctx: Context, config: Config) {
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
-        // 在调用API前加入队列，并收集发送的消息ID（用于后续撤回）
-        const processingMsgIds: string[] = []
-        const queueMsgIds = await waitForQueue(session)
-        processingMsgIds.push(...queueMsgIds)
+        const processingMsgIds = await sendB50ProcessingNotice(session, 'mai上传B50')
+        const uploadStartedAt = Date.now()
 
         // 上传B50（使用新API，需要qr_text）
         let result
@@ -4651,11 +4906,9 @@ export function apply(ctx: Context, config: Config) {
             logger.info('使用缓存的SGID失败，尝试重新获取SGID')
             const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
             if (retryQrText.error) {
+              await recallBotMessages(session, processingMsgIds)
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
-            // 在调用API前加入队列
-            const retryQueueMsgIds = await waitForQueue(session)
-            processingMsgIds.push(...retryQueueMsgIds)
             result = await api.uploadB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -4675,11 +4928,9 @@ export function apply(ctx: Context, config: Config) {
             const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
             if (retryQrText.error) {
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              await recallBotMessages(session, processingMsgIds)
               return `❌ 上传失败：${result.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`
             }
-            // 在调用API前加入队列
-            const retryQueueMsgIds = await waitForQueue(session)
-            processingMsgIds.push(...retryQueueMsgIds)
             result = await api.uploadB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -4707,17 +4958,20 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        const statsInfo = await getUploadStats('mai上传B50')
-        const statsStr = statsInfo ? `\n${statsInfo}` : ''
-        const successMessage = `✅ B50上传任务已提交！${statsStr}\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+        const successMessage = formatB50UploadSuccessMessage(result)
         const refId = await logOperation({
           command: 'mai上传B50',
           session,
           targetUserId,
           status: 'success',
           result: successMessage,
-          apiResponse: result,
+          apiResponse: { ...result, elapsedMs: Date.now() - uploadStartedAt },
         })
+
+        if (isSyncB50Upload(result)) {
+          await recallBotMessages(session, processingMsgIds)
+          return appendRefId(successMessage, refId)
+        }
 
         // 发送成功消息并获取消息ID（用于后续撤回）
         const successMsgIds = await sendAndGetMessageIds(session, appendRefId(successMessage, refId))
@@ -4844,10 +5098,11 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const results: string[] = []
+        await sendB50ProcessingNotice(session, ['mai上传B50', 'mai上传落雪b50'])
+        const uaUploadStartedAt = Date.now()
 
         // 先上传水鱼B50，等待完成后再上传落雪（串行执行，避免同时登录）
         try {
-          await waitForQueue(session)
           let fishResult = await api.uploadB50(
             machineInfo.regionId,
             machineInfo.clientId,
@@ -4864,8 +5119,6 @@ export function apply(ctx: Context, config: Config) {
               const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
               return `🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`
             }
-            // 在调用API前加入队列
-            await waitForQueue(session)
             fishResult = await api.uploadB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -4886,16 +5139,18 @@ export function apply(ctx: Context, config: Config) {
               results.push(`🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}`)
             }
           } else {
-            const successMessage = `🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`
+            const successMessage = formatB50UploadSuccessMessage(fishResult, { prefix: '🐟 水鱼: ' })
             const refId = await logOperation({
               command: 'maiua-水鱼B50',
               session,
               targetUserId: actualTargetUserId,
               status: 'success',
               result: successMessage,
-              apiResponse: fishResult,
+              apiResponse: { ...fishResult, elapsedMs: Date.now() - uaUploadStartedAt },
             })
-            scheduleB50Notification(session, fishResult.task_id, refId)
+            if (!isSyncB50Upload(fishResult)) {
+              scheduleB50Notification(session, fishResult.task_id, refId)
+            }
             results.push(appendRefId(successMessage, refId))
           }
         } catch (error: any) {
@@ -4906,8 +5161,6 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `🐟 水鱼: ❌ 获取二维码失败：${retryQrText.error}`
             }
-            // 在调用API前加入队列
-            await waitForQueue(session)
             try {
               const fishResult = await api.uploadB50(
                 machineInfo.regionId,
@@ -4924,8 +5177,10 @@ export function apply(ctx: Context, config: Config) {
                   return `🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}`
                 }
               } else {
-                scheduleB50Notification(session, fishResult.task_id)
-                results.push(`🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
+                if (!isSyncB50Upload(fishResult)) {
+                  scheduleB50Notification(session, fishResult.task_id)
+                }
+                results.push(formatB50UploadSuccessMessage(fishResult, { prefix: '🐟 水鱼: ' }))
               }
             } catch (retryError: any) {
               if (retryError?.code === 'ECONNABORTED' || String(retryError?.message || '').includes('timeout')) {
@@ -4949,8 +5204,8 @@ export function apply(ctx: Context, config: Config) {
 
         // 等待水鱼上传完成后再上传落雪（避免同时登录导致失败）
         // 上传落雪B50
+        const lxUploadStartedAt = Date.now()
         try {
-          await waitForQueue(session)
           let lxResult = await api.uploadLxB50(
             machineInfo.regionId,
             machineInfo.clientId,
@@ -4967,8 +5222,6 @@ export function apply(ctx: Context, config: Config) {
               const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
               results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`)
             } else {
-              // 在调用API前加入队列
-              await waitForQueue(session)
               lxResult = await api.uploadLxB50(
                 machineInfo.regionId,
                 machineInfo.clientId,
@@ -4990,16 +5243,18 @@ export function apply(ctx: Context, config: Config) {
               results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}`)
             }
           } else {
-            const successMessage = `❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`
+            const successMessage = formatB50UploadSuccessMessage(lxResult, { prefix: '❄️ 落雪: ' })
             const refId = await logOperation({
               command: 'maiua-落雪B50',
               session,
               targetUserId: actualTargetUserId,
               status: 'success',
               result: successMessage,
-              apiResponse: lxResult,
+              apiResponse: { ...lxResult, elapsedMs: Date.now() - lxUploadStartedAt },
             })
-            scheduleLxB50Notification(session, lxResult.task_id, refId)
+            if (!isSyncB50Upload(lxResult)) {
+              scheduleLxB50Notification(session, lxResult.task_id, refId)
+            }
             results.push(appendRefId(successMessage, refId))
           }
         } catch (error: any) {
@@ -5010,8 +5265,6 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               results.push(`❄️ 落雪: ❌ 获取二维码失败：${retryQrText.error}`)
             } else {
-              // 在调用API前加入队列
-              await waitForQueue(session)
               try {
                 const lxResult = await api.uploadLxB50(
                   machineInfo.regionId,
@@ -5028,16 +5281,18 @@ export function apply(ctx: Context, config: Config) {
                     results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}`)
                   }
                 } else {
-                  const successMessage = `❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`
+                  const successMessage = formatB50UploadSuccessMessage(lxResult, { prefix: '❄️ 落雪: ' })
                   const refId = await logOperation({
                     command: 'maiua-落雪B50',
                     session,
                     targetUserId: actualTargetUserId,
                     status: 'success',
                     result: successMessage,
-                    apiResponse: lxResult,
+                    apiResponse: { ...lxResult, elapsedMs: Date.now() - lxUploadStartedAt },
                   })
-                  scheduleLxB50Notification(session, lxResult.task_id, refId)
+                  if (!isSyncB50Upload(lxResult)) {
+                    scheduleLxB50Notification(session, lxResult.task_id, refId)
+                  }
                   results.push(appendRefId(successMessage, refId))
                 }
               } catch (retryError: any) {
@@ -5348,8 +5603,6 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        await waitForQueue(session)
-
         await session.send('请求已提交，请等待服务器响应。（通常约 2–3 分钟）')
 
         // 根据收藏品类型选择对应的 API
@@ -5418,7 +5671,6 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
-            await waitForQueue(session)
             // 重试同样的 API 调用
             if (itemKind === 5 || itemKind === 6 || itemKind === 7 || itemKind === 8) {
               let remaster = 0
@@ -5463,7 +5715,6 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
-            await waitForQueue(session)
             // 重试
             if (itemKind === 5 || itemKind === 6 || itemKind === 7 || itemKind === 8) {
               let remaster = 0
@@ -5627,7 +5878,6 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        await waitForQueue(session)
         await session.send('请求已提交，请等待服务器响应。（通常需要约 2–3 分钟）')
 
         let result
@@ -5816,7 +6066,6 @@ export function apply(ctx: Context, config: Config) {
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
-        await waitForQueue(session)
         await session.send('请求已提交，请等待服务器响应。（包含约60秒安全等待）')
 
         // 使用新API上传成绩
@@ -5840,7 +6089,6 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
-            await waitForQueue(session)
             result = await api.uploadScoreManual(
               retryQrText.qrText,
               scoreData.musicId,
@@ -5865,7 +6113,6 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
-            await waitForQueue(session)
             result = await api.uploadScoreManual(
               retryQrText.qrText,
               scoreData.musicId,
@@ -5983,7 +6230,6 @@ export function apply(ctx: Context, config: Config) {
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
-        await waitForQueue(session)
         await session.send('请求已提交，请等待服务器响应。（包含约60秒安全等待）')
 
         // 5. 调用API
@@ -6108,10 +6354,8 @@ export function apply(ctx: Context, config: Config) {
           return `❌ 获取二维码失败：${qrTextResult.error}${getErrorHelpInfo()}`
         }
 
-        // 在调用API前加入队列，并收集发送的消息ID（用于后续撤回）
-        const processingMsgIds: string[] = []
-        const queueMsgIds = await waitForQueue(session)
-        processingMsgIds.push(...queueMsgIds)
+        const processingMsgIds = await sendB50ProcessingNotice(session, 'mai上传落雪b50')
+        const uploadStartedAt = Date.now()
 
         // 上传落雪B50（使用新API，需要qr_text）
         let result
@@ -6129,10 +6373,9 @@ export function apply(ctx: Context, config: Config) {
             logger.info('使用缓存的SGID失败，尝试重新获取SGID')
             const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
             if (retryQrText.error) {
+              await recallBotMessages(session, processingMsgIds)
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
-            const retryQueueMsgIds = await waitForQueue(session)
-            processingMsgIds.push(...retryQueueMsgIds)
             result = await api.uploadLxB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -6151,10 +6394,9 @@ export function apply(ctx: Context, config: Config) {
             const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
             if (retryQrText.error) {
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              await recallBotMessages(session, processingMsgIds)
               return `❌ 上传失败：${result.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`
             }
-            const retryQueueMsgIds = await waitForQueue(session)
-            processingMsgIds.push(...retryQueueMsgIds)
             result = await api.uploadLxB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -6182,17 +6424,20 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        const statsInfo = await getUploadStats('mai上传落雪b50')
-        const statsStr = statsInfo ? `\n${statsInfo}` : ''
-        const successMessage = `✅ 落雪B50上传任务已提交！${statsStr}\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+        const successMessage = formatB50UploadSuccessMessage(result)
         const refId = await logOperation({
           command: 'mai上传落雪b50',
           session,
           targetUserId: actualTargetUserId || undefined,
           status: 'success',
           result: successMessage,
-          apiResponse: result,
+          apiResponse: { ...result, elapsedMs: Date.now() - uploadStartedAt },
         })
+
+        if (isSyncB50Upload(result)) {
+          await recallBotMessages(session, processingMsgIds)
+          return appendRefId(successMessage, refId)
+        }
 
         // 发送成功消息并获取消息ID（用于后续撤回）
         const successMsgIds = await sendAndGetMessageIds(session, appendRefId(successMessage, refId))
@@ -7868,5 +8113,98 @@ export function apply(ctx: Context, config: Config) {
       }
       const removed = await clearUserCooldownsForKeys(ctx, candidates)
       return `✅ 已清除 ${removed} 条冷却记录。\n尝试匹配的用户键：${candidates.join('、')}`
+    })
+
+  ctx.command('mai管理员重置用户协议 [targetUserId:text]', '清除目标用户的协议确认记录，使其下次使用时重新确认')
+    .userFields(['authority'])
+    .action(async ({ session }, targetUserId) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < authLevelForProxy) {
+        return `❌ 权限不足，需要 auth 等级 ${authLevelForProxy} 以上`
+      }
+
+      const target = targetUserId?.trim() || ''
+
+      if (target.toLowerCase() === 'all') {
+        const confirmed = await promptYesLocal(
+          session,
+          '⚠️ 即将清除【所有用户】的协议确认记录，所有用户下次使用功能时均需重新确认协议',
+        )
+        if (!confirmed) return '已取消'
+        const all = await ctx.database.get('maibot_user_terms', {})
+        const count = all.length
+        for (const row of all) {
+          await clearTermsAccepted(row.userId)
+        }
+        return count > 0
+          ? `✅ 已清除全部 ${count} 条用户协议确认记录`
+          : 'ℹ️ 当前没有任何用户协议确认记录'
+      }
+
+      let candidates: string[] = []
+      if (target) {
+        candidates = await resolveCooldownKeyCandidatesForBypass(session, target)
+        if (!candidates.length) {
+          return '❌ 无法解析目标用户，请使用 @用户 或数字 ID'
+        }
+      } else {
+        const canonical = await getCanonicalV2UserId(session)
+        const keys = await getSessionBindingKeys(ctx, session)
+        candidates = [...new Set([canonical, ...keys].filter(Boolean))]
+      }
+
+      let cleared = 0
+      for (const key of candidates) {
+        const rows = await ctx.database.get('maibot_user_terms', { userId: key })
+        if (rows.length) {
+          await clearTermsAccepted(key)
+          cleared++
+        }
+      }
+      return cleared > 0
+        ? `✅ 已清除 ${cleared} 条用户协议确认记录，相关用户下次使用功能时需重新确认。\n匹配键：${candidates.join('、')}`
+        : `ℹ️ 未找到已确认的协议记录。\n匹配键：${candidates.join('、')}`
+    })
+
+  ctx.command('maiSGID获取 [input:text]', '调试：测试从文本/链接/图片消息提取 SGID')
+    .alias('SGID获取')
+    .userFields(['authority'])
+    .action(async ({ session }, input) => {
+      if (!session) return '❌ 无法获取会话信息'
+
+      const canUse =
+        (session.user?.authority ?? 0) >= authLevelForProxy ||
+        (debugEnabled && isDebugSession(session))
+      if (!canUse) {
+        return `❌ 权限不足：需要 auth 等级 ${authLevelForProxy} 以上，或在调试群内且开启 debug 模式`
+      }
+
+      if (input?.trim()) {
+        const result = extractSgidFromText(input.trim())
+        return formatSgidExtractReport(result)
+      }
+
+      const tracker = createBotMessageTracker(session, ctx, autoRecallInteractive)
+      await tracker.send(
+        `【SGID 提取测试】请在 ${Math.floor(rebindTimeout / 1000)} 秒内发送：\n` +
+          `• SGID 纯文本\n• wahlap req/img 链接\n• 玩家二维码图片\n\n${INTERACTIVE_CANCEL_HINT}`,
+      )
+
+      const replySession = await waitForUserReply(session, ctx, rebindTimeout)
+      await tracker.recall()
+
+      if (!replySession) {
+        return '❌ 等待输入超时'
+      }
+
+      const replyText = replySession.content?.trim() || ''
+      if (isInteractiveCancel(replyText)) {
+        return '已取消'
+      }
+
+      await tryRecallMessage(replySession, ctx, config, replySession.messageId)
+
+      const result = await extractSgidFromSession(replySession)
+      return formatSgidExtractReport(result)
     })
 }
