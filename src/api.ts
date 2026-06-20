@@ -46,20 +46,29 @@ export function findMatchingChargeTask(
   chargeId: number,
   qrText: string,
   clientId?: string,
+  maiUid?: string,
 ): ChargeQueueTask | undefined {
   const sorted = [...tasks].sort(
     (a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime(),
   )
+  const qr = qrText.trim()
+  const uid = maiUid?.trim()
   return sorted.find((t) => {
     if (t.chargeId !== chargeId) return false
+
+    if (uid && String(t.userId) === uid) return true
+
     const token = (t.qrToken || '').trim()
-    const qr = qrText.trim()
     if (token && qr) {
       if (token === qr) return true
       if (qr.startsWith(token) || token.startsWith(qr)) return true
       if (qr.length <= 64 && token.startsWith(qr)) return true
     }
-    if (clientId && t.keychip === clientId && !token) return true
+
+    if (clientId && t.keychip === clientId && uid && String(t.userId) === uid) {
+      return true
+    }
+
     return false
   })
 }

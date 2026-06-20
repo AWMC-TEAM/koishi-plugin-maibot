@@ -4,6 +4,7 @@ import {
   MaiBotAPI,
   UserPreview,
   formatAccountStatusBlock,
+  ChargeQueueTask,
   findMatchingChargeTask,
   formatChargeTaskStatus,
   isSyncB50Upload,
@@ -320,7 +321,7 @@ export const Config: Schema<Config> = Schema.object({
   }),
   replyInGroup: Schema.boolean().default(true).description('群聊内 Bot 回复时引用用户消息并 @ 发送者'),
   chargePollInterval: Schema.number().default(3000).description('发票充值队列轮询间隔（毫秒），默认 3 秒'),
-  chargePollTimeout: Schema.number().default(180000).description('发票充值队列轮询超时（毫秒），默认 3 分钟'),
+  chargePollTimeout: Schema.number().default(600000).description('发票充值队列轮询超时（毫秒），默认 10 分钟'),
 }).description(
   '【公共 API】申请 https://api.awmc.team',
 )
@@ -2172,7 +2173,7 @@ export function apply(ctx: Context, config: Config) {
   const operationLogConfig = config.operationLog || { enabled: true, refIdLabel: 'Ref_ID' }
   const replyInGroupEnabled = config.replyInGroup !== false
   const chargePollIntervalMs = config.chargePollInterval ?? 3000
-  const chargePollTimeoutMs = config.chargePollTimeout ?? 180000
+  const chargePollTimeoutMs = config.chargePollTimeout ?? 600000
 
   // 错误帮助URL配置
   const errorHelpUrl = config.errorHelpUrl || ''
@@ -3604,19 +3605,28 @@ export function apply(ctx: Context, config: Config) {
 
   const scheduleChargeNotification = (
     session: Session,
-    params: { chargeId: number; qrText: string; submitRefId?: string },
+    params: { chargeId: number; qrText: string; submitRefId?: string; maiUid?: string },
   ) => {
     if (isPublicApi) return
     stashTriggerSessionMeta(session)
     const bot = session.bot
     const channelId = session.channelId
-    if (!bot || !channelId) return
+    if (!bot || !channelId) {
+      logger.warn('无法追踪发票任务：缺少 bot 或 channelId')
+      return
+    }
 
     const pollInterval = chargePollIntervalMs
     const pollTimeout = chargePollTimeoutMs
     const maxAttempts = Math.ceil(pollTimeout / pollInterval)
     const clientId = machineInfo?.clientId ?? ''
+    const maiUid = params.maiUid?.trim()
     let attempts = 0
+    let sawActiveTask = false
+    let lastSeenTask: ChargeQueueTask | undefined
+
+    const findTask = (tasks: ChargeQueueTask[]) =>
+      findMatchingChargeTask(tasks, params.chargeId, params.qrText, clientId, maiUid)
 
     const poll = async () => {
       attempts += 1
@@ -3629,7 +3639,12 @@ export function apply(ctx: Context, config: Config) {
           return
         }
 
-        const task = findMatchingChargeTask(q.tasks, params.chargeId, params.qrText, clientId)
+        const task = findTask(q.tasks)
+        if (task?.status === 'pending' || task?.status === 'processing') {
+          sawActiveTask = true
+          lastSeenTask = task
+        }
+
         if (task?.status === 'done') {
           const taskRefId = await logOperation({
             command: 'mai发票-任务完成',
@@ -3645,6 +3660,7 @@ export function apply(ctx: Context, config: Config) {
           )
           return
         }
+
         if (task?.status === 'failed') {
           const taskRefId = await logOperation({
             command: 'mai发票-任务失败',
@@ -3662,6 +3678,42 @@ export function apply(ctx: Context, config: Config) {
           return
         }
 
+        // 服务端完成后会从队列移除任务：曾见过 pending/processing 后消失视为成功
+        if (!task && sawActiveTask) {
+          const taskRefId = await logOperation({
+            command: 'mai发票-任务完成',
+            session,
+            status: 'success',
+            result: lastSeenTask
+              ? `${formatChargeTaskStatus(lastSeenTask)} → 已从队列完成`
+              : `${params.chargeId} 倍发票已从队列完成`,
+            apiResponse: { ...lastSeenTask, submitRefId: params.submitRefId, inferredDone: true },
+          })
+          await sendBotNotification(
+            session,
+            `✅ ${params.chargeId} 倍发票充值已完成\n任务已从服务端队列完成，请在游戏内确认到账`,
+            taskRefId,
+          )
+          return
+        }
+
+        // 处理极快完成（首次轮询前已出队）：入队成功后连续若干次找不到任务
+        if (!task && !sawActiveTask && attempts >= 3) {
+          const taskRefId = await logOperation({
+            command: 'mai发票-任务完成',
+            session,
+            status: 'success',
+            result: `${params.chargeId} 倍发票队列中已无匹配任务（可能已快速完成）`,
+            apiResponse: { chargeId: params.chargeId, submitRefId: params.submitRefId, inferredDone: true },
+          })
+          await sendBotNotification(
+            session,
+            `✅ ${params.chargeId} 倍发票可能已完成\n服务端队列中已无该任务，请在游戏内确认到账\n若未到账可使用 /maiqueue ${params.submitRefId || ''} 查询`,
+            taskRefId,
+          )
+          return
+        }
+
         if (attempts < maxAttempts) {
           ctx.setTimeout(poll, pollInterval)
           return
@@ -3672,14 +3724,14 @@ export function apply(ctx: Context, config: Config) {
           session,
           status: 'failure',
           errorMessage: `轮询超时（${Math.round(pollTimeout / 60000)} 分钟）`,
-          apiResponse: { chargeId: params.chargeId, submitRefId: params.submitRefId },
+          apiResponse: { chargeId: params.chargeId, submitRefId: params.submitRefId, sawActiveTask },
         })
         const hint = params.submitRefId
           ? `\n可使用 /maiqueue ${params.submitRefId} 查询最新状态`
           : ''
         await sendBotNotification(
           session,
-          `⏳ ${params.chargeId} 倍发票充值仍在处理或已移出队列（轮询 ${Math.round(pollTimeout / 60000)} 分钟）${hint}`,
+          `⏳ ${params.chargeId} 倍发票充值仍在处理（轮询 ${Math.round(pollTimeout / 60000)} 分钟）${hint}`,
           timeoutRefId,
         )
       } catch (error) {
@@ -3992,7 +4044,7 @@ export function apply(ctx: Context, config: Config) {
               return `❌ 未找到 Ref_ID: ${refId}`
             }
             const log = logs[0]
-            let meta: { chargeId?: number; qrTextPrefix?: string; clientId?: string } = {}
+            let meta: { chargeId?: number; qrTextPrefix?: string; clientId?: string; maiUid?: string } = {}
             if (log.apiResponse) {
               try {
                 meta = JSON.parse(log.apiResponse)
@@ -4009,6 +4061,7 @@ export function apply(ctx: Context, config: Config) {
               meta.chargeId,
               qrHint,
               meta.clientId || machineInfo?.clientId,
+              meta.maiUid,
             )
             if (!task) {
               const doneLogs = await ctx.database.get('maibot_operation_logs', {})
@@ -4033,8 +4086,9 @@ export function apply(ctx: Context, config: Config) {
           const binding = await getBindingBySession(ctx, session)
           const qrText = binding?.lastQrCode?.trim()
           if (qrText?.startsWith('SGWCMAID')) {
+            const mineUid = binding?.maiUid && isNumericMaiUid(binding.maiUid) ? binding.maiUid : undefined
             const mine = q.tasks.filter(
-              (t) => findMatchingChargeTask([t], t.chargeId, qrText, machineInfo?.clientId),
+              (t) => findMatchingChargeTask([t], t.chargeId, qrText, machineInfo?.clientId, mineUid),
             )
             if (mine.length) {
               msg += '\n\n📌 与您最近 SGID 相关的任务：'
@@ -5303,6 +5357,7 @@ export function apply(ctx: Context, config: Config) {
             chargeId: multiple,
             qrTextPrefix: qrTextResult.qrText.substring(0, 48),
             clientId: machineInfo?.clientId,
+            maiUid: isNumericMaiUid(binding.maiUid) ? binding.maiUid : undefined,
             queueMsg: ticketResult.queueMsg,
           },
         })
@@ -5311,6 +5366,7 @@ export function apply(ctx: Context, config: Config) {
             chargeId: multiple,
             qrText: qrTextResult.qrText,
             submitRefId: refId,
+            maiUid: isNumericMaiUid(binding.maiUid) ? binding.maiUid : undefined,
           })
         }
         return appendRefId(successMessage, refId)
