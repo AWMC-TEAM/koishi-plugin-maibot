@@ -178,7 +178,7 @@ export class MaiBotAPI {
   public debugLogger: ((tag: string, payload: any, fromDebugSession: boolean) => void) | null = null
 
   constructor(config: ApiConfig) {
-    this.retryCount = config.retryCount ?? 5
+    this.retryCount = config.retryCount ?? 3
     this.retryDelay = config.retryDelay ?? 1000
     this.apiStyle = config.apiStyle ?? 'team'
     const headers: Record<string, string> = {
@@ -192,8 +192,8 @@ export class MaiBotAPI {
       timeout: config.timeout || 30000,
       headers,
     })
-    this.setupRetry()
     this.setupDebugInterceptor()
+    this.setupRetry()
   }
 
   private setupDebugInterceptor(): void {
@@ -299,30 +299,54 @@ export class MaiBotAPI {
       async (error) => {
         const originalConfig = error?.config as (typeof error.config & {
           __retryCount?: number
+          __fromDebugSession?: boolean
         })
         if (!originalConfig) {
           return Promise.reject(error)
         }
 
+        const status = error?.response?.status as number | undefined
+        const code = error?.code as string | undefined
         const shouldRetry =
-          error?.code === 'ECONNRESET'
-          || error?.code === 'ETIMEDOUT'
-          || error?.response?.status === 429
-          || (error?.response?.status != null && error.response.status >= 500)
-
-        const maxRetries = (originalConfig as { __swUserApiMaxRetries?: number }).__swUserApiMaxRetries ?? this.retryCount
+          code === 'ECONNABORTED'
+          || code === 'ECONNRESET'
+          || code === 'ETIMEDOUT'
+          || code === 'ERR_NETWORK'
+          || code === 'ENOTFOUND'
+          || code === 'EAI_AGAIN'
+          || status === 408
+          || status === 429
+          || (status != null && status >= 500)
+          || (error?.request && status == null)
 
         const currentRetry = originalConfig.__retryCount ?? 0
-        if (!shouldRetry || currentRetry >= maxRetries) {
+        if (!shouldRetry || currentRetry >= this.retryCount) {
           return Promise.reject(error)
         }
 
         originalConfig.__retryCount = currentRetry + 1
-        if (this.retryDelay > 0) {
-          await new Promise((resolve) => setTimeout(resolve, this.retryDelay))
+        const delayMs = this.retryDelay * originalConfig.__retryCount
+
+        if (this.debugLogger) {
+          try {
+            this.debugLogger('API RETRY', {
+              attempt: originalConfig.__retryCount,
+              maxRetries: this.retryCount,
+              delayMs,
+              status,
+              code,
+              method: originalConfig.method?.toUpperCase(),
+              url: originalConfig.url,
+              fullUrl: (originalConfig.baseURL || '') + (originalConfig.url || ''),
+            }, originalConfig.__fromDebugSession === true)
+          } catch { /* 忽略 */ }
+        }
+
+        if (delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs))
         }
         return this.client.request(originalConfig)
-      }
+      },
     )
   }
 
@@ -383,8 +407,6 @@ export class MaiBotAPI {
     return record
   }
 
-  /** team 用户类接口（user/data、user/charge）最多重试 3 次 */
-  private static readonly SW_USER_API_RETRIES = 3
   private static readonly SW_USER_DATA_TIMEOUT_MS = 120000
 
   private async postSwUserApi(
@@ -394,8 +416,7 @@ export class MaiBotAPI {
   ): Promise<Record<string, unknown>> {
     const response = await this.client.post(this.swPath(path), body, {
       timeout: timeoutMs ?? this.client.defaults.timeout,
-      __swUserApiMaxRetries: MaiBotAPI.SW_USER_API_RETRIES,
-    } as any)
+    })
     return this.parseSwWrappedResponse(response.data)
   }
 

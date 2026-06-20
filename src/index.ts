@@ -179,7 +179,7 @@ export const Config: Schema<Config> = Schema.object({
     .default('http://localhost:5001')
     .description('API 根地址。team 模式一般为 sw-api 地址（如 http://localhost:5001）；public 模式一般为 https://api.awmc.team'),
   apiTimeout: Schema.number().default(30000).description('API请求超时时间（毫秒）'),
-  apiRetryCount: Schema.number().default(5).description('API请求重试次数（仅在 ECONNRESET 或 504 时生效）'),
+  apiRetryCount: Schema.number().default(3).description('API 失败后的重试次数（默认 3 次；对 5xx/408/429、超时与网络错误生效）'),
   apiRetryDelay: Schema.number().default(1000).description('API请求重试间隔（毫秒）'),
   machineInfo: Schema.object({
     clientId: Schema.string().required().description('客户端ID'),
