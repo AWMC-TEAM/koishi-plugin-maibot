@@ -89,7 +89,7 @@ export function commandToCooldownSlot(commandName: string): string | null {
   if (base === 'mai发票') return 'ticket'
   if (base === 'mai上传乐曲成绩' || base === 'mai获取收藏品' || base === 'mai删除成绩') return 'ticket'
   if (base === 'mai上传b50' || base === 'maiua' || base === 'mai上传落雪b50') return 'b50'
-  if (base === 'mai状态' || base === 'mymai') return 'status'
+  if (base === 'mai状态' || base === 'mymai' || base === 'mai地图') return 'status'
   return 'default'
 }
 

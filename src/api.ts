@@ -158,6 +158,74 @@ export interface GetChargeOptions {
   userId?: string
 }
 
+export interface UserRegionEntry {
+  regionId: number
+  playCount: number
+  created: string
+}
+
+export interface UserRegionResult {
+  userId: number
+  length: number
+  userRegionList: UserRegionEntry[]
+}
+
+export const WAHLAP_REGIONS: Record<number, string> = {
+  1: '北京',
+  2: '重庆',
+  3: '上海',
+  4: '天津',
+  5: '安徽',
+  6: '福建',
+  7: '甘肃',
+  8: '广东',
+  9: '贵州',
+  10: '海南',
+  11: '河北',
+  12: '黑龙江',
+  13: '河南',
+  14: '湖北',
+  15: '湖南',
+  16: '江苏',
+  17: '江西',
+  18: '吉林',
+  19: '辽宁',
+  20: '青海',
+  21: '陕西',
+  22: '山东',
+  23: '山西',
+  24: '四川',
+  25: '未知25',
+  26: '云南',
+  27: '浙江',
+  28: '广西',
+  29: '内蒙古',
+  30: '宁夏',
+  31: '新疆',
+  32: '西藏',
+}
+
+export function formatWahlapRegionName(regionId: number): string {
+  return WAHLAP_REGIONS[regionId] ?? `未知(${regionId})`
+}
+
+export function formatUserRegionBlock(result: UserRegionResult): string {
+  const sorted = [...result.userRegionList].sort((a, b) => b.playCount - a.playCount)
+  const totalPlayCount = sorted.reduce((sum, item) => sum + item.playCount, 0)
+  const lines = [
+    `记录地区数: ${result.length}`,
+    `总游玩次数: ${totalPlayCount}`,
+    '',
+    '🗺️ 游玩地区：',
+  ]
+  for (const item of sorted) {
+    lines.push(
+      `  ${formatWahlapRegionName(item.regionId)} · ${item.playCount} 次 · 首次 ${item.created}`,
+    )
+  }
+  return lines.join('\n')
+}
+
 export function formatChargeTaskStatus(task: ChargeQueueTask): string {
   const statusLabel: Record<ChargeQueueTask['status'], string> = {
     pending: '排队中',
@@ -486,8 +554,10 @@ export class MaiBotAPI {
     const loginStatus = ud.loginStatus ?? ud.LoginStatus ?? raw.loginStatus ?? raw.LoginStatus
     const logoutStatus = ud.logoutStatus ?? ud.LogoutStatus ?? raw.logoutStatus ?? raw.LogoutStatus
     const qrStatus = ud.qrStatus ?? ud.QrStatus ?? raw.qrStatus ?? raw.QrStatus
+    const userId = this.numField(raw, 'userId', 'UserID') ?? this.numField(ud, 'userId', 'UserID')
 
     const normalizeTicketList = (list: unknown) => {
+      if (list == null) return undefined
       if (!Array.isArray(list)) return undefined
       return list.map((t: Record<string, unknown>) => ({
         chargeId: Number(t.chargeId ?? t.ChargeId ?? 0),
@@ -499,6 +569,7 @@ export class MaiBotAPI {
     }
 
     const normalizeFreeTicketList = (list: unknown) => {
+      if (list == null) return undefined
       if (!Array.isArray(list)) return undefined
       return list.map((t: Record<string, unknown>) => ({
         chargeId: Number(t.chargeId ?? t.ChargeId ?? 0),
@@ -510,8 +581,12 @@ export class MaiBotAPI {
     const userFreeChargeList =
       ud.userFreeChargeList ?? ud.UserFreeChargeList ?? raw.userFreeChargeList ?? raw.UserFreeChargeList
 
+    const hasNewChargeResponse =
+      userId != null
+      && ('userChargeList' in raw || 'UserChargeList' in raw || 'length' in raw || 'Length' in raw)
+
     return {
-      ChargeStatus: chargeStatus === true || chargeStatus === 1 || returnCode === 1,
+      ChargeStatus: chargeStatus === true || chargeStatus === 1 || returnCode === 1 || hasNewChargeResponse,
       LoginStatus: loginStatus === true || loginStatus === 1,
       LogoutStatus: logoutStatus === true || logoutStatus === 1,
       QrStatus: qrStatus === true || qrStatus === 1,
@@ -567,6 +642,81 @@ export class MaiBotAPI {
       MaiBotAPI.SW_USER_DATA_TIMEOUT_MS,
     )
     return this.normalizePreviewFromPayload(raw)
+  }
+
+  private normalizeUserRegionFromPayload(raw: Record<string, unknown>): UserRegionResult {
+    const userId = this.numField(raw, 'userId', 'UserID')
+    const length = this.numField(raw, 'length', 'Length')
+    const listRaw = raw.userRegionList ?? raw.UserRegionList
+    if (!Array.isArray(listRaw)) {
+      throw new Error('API 响应缺少 userRegionList')
+    }
+
+    const userRegionList: UserRegionEntry[] = listRaw.map((item, index) => {
+      if (item == null || typeof item !== 'object') {
+        throw new Error(`userRegionList[${index}] 格式无效`)
+      }
+      const record = item as Record<string, unknown>
+      const regionId = this.numField(record, 'regionId', 'RegionId')
+      const playCount = this.numField(record, 'playCount', 'PlayCount')
+      const created = record.created ?? record.Created
+      if (regionId == null) {
+        throw new Error(`userRegionList[${index}] 缺少 regionId`)
+      }
+      if (playCount == null || playCount < 0) {
+        throw new Error(`userRegionList[${index}] 缺少或无效的 playCount`)
+      }
+      if (typeof created !== 'string' || !created.trim()) {
+        throw new Error(`userRegionList[${index}] 缺少 created`)
+      }
+      return {
+        regionId,
+        playCount,
+        created: created.trim(),
+      }
+    })
+
+    if (userId == null) {
+      throw new Error('API 响应缺少 userId')
+    }
+    if (length == null) {
+      throw new Error('API 响应缺少 length')
+    }
+    if (length !== userRegionList.length) {
+      throw new Error(
+        `API 响应 length(${length}) 与 userRegionList 条目数(${userRegionList.length}) 不一致`,
+      )
+    }
+
+    return { userId, length, userRegionList }
+  }
+
+  /**
+   * 查询用户游玩地区
+   * team: POST /awmc/api/v1/user/region（qrcode + keychip）
+   */
+  async getUserRegion(clientId: string, qrText: string): Promise<UserRegionResult> {
+    if (this.apiStyle === 'public') {
+      throw new Error('public 模式暂不支持查询游玩地图')
+    }
+    const keychip = clientId?.trim()
+    if (!keychip) {
+      throw new Error('缺少 keychip 配置，请在 machineInfo.clientId 中填写')
+    }
+    const qrcode = qrText?.trim()
+    if (!qrcode) {
+      throw new Error('请提供二维码')
+    }
+    if (!qrcode.startsWith('SGWCMAID')) {
+      throw new Error('二维码格式无效，需以 SGWCMAID 开头')
+    }
+
+    const raw = await this.postSwUserApi(
+      '/user/region',
+      this.swQrBody(qrcode, keychip),
+      MaiBotAPI.SW_USER_DATA_TIMEOUT_MS,
+    )
+    return this.normalizeUserRegionFromPayload(raw)
   }
 
   /**
@@ -926,41 +1076,34 @@ export class MaiBotAPI {
   /**
    * 获取用户功能票
    * public: GET /v1/get_charge?qr_text=...
-   * team: POST /awmc/api/v1/user/charge（userId + keychip）
+   * team: POST /awmc/api/v1/user/charge（qrcode + keychip，只读查询；userChargeList 为 null 表示无有效票券）
    */
   async getCharge(
-    regionId: number,
+    _regionId: number,
     clientId: string,
-    placeId: number,
+    _placeId: number,
     qrText: string,
-    options?: GetChargeOptions,
+    _options?: GetChargeOptions,
   ): Promise<ChargeResult> {
     if (this.apiStyle === 'public') {
       const response = await this.client.get('/v1/get_charge', { params: { qr_text: qrText } })
       return response.data
     }
 
-    let userId = options?.userId
-    if (!userId && qrText) {
-      const preview = await this.getPreview(clientId, qrText, { regionId, placeId })
-      if (preview.UserID === -1 || preview.UserID === '-1') {
-        return {
-          ChargeStatus: false,
-          LoginStatus: false,
-          LogoutStatus: false,
-          QrStatus: false,
-        }
-      }
-      userId = String(preview.UserID)
+    const keychip = clientId?.trim()
+    if (!keychip) {
+      throw new Error('缺少 keychip 配置，请在 machineInfo.clientId 中填写')
     }
-    if (!userId) {
-      throw new Error('team 模式 getCharge 需要 userId 或 qrcode')
+    const qrcode = qrText?.trim()
+    if (!qrcode) {
+      throw new Error('team 模式 getCharge 需要 qrcode')
     }
 
-    const raw = await this.postSwUserApi('/user/charge', {
-      userId,
-      keychip: clientId,
-    })
+    const raw = await this.postSwUserApi(
+      '/user/charge',
+      this.swQrBody(qrcode, keychip),
+      MaiBotAPI.SW_USER_DATA_TIMEOUT_MS,
+    )
     return this.normalizeChargeFromPayload(raw)
   }
 

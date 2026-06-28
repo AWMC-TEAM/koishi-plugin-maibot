@@ -4,6 +4,7 @@ import {
   MaiBotAPI,
   UserPreview,
   formatAccountStatusBlock,
+  formatUserRegionBlock,
   ChargeQueueTask,
   findMatchingChargeTask,
   formatChargeTaskStatus,
@@ -3802,13 +3803,15 @@ export function apply(ctx: Context, config: Config) {
   /mai解绑 - 解绑舞萌DX账号
   /mai状态 - 查询绑定状态
   /mymai - 与 /mai状态 相同（别名）
+  /mai地图 - 查询账号游玩过的省份/地区
   /maiping - 测试机台连接
   /maiqueue [Ref_ID] - 查询发票充值队列状态（可带 Ref_ID 查单笔）`)
 
       // 有权限的代操作命令
       if (canProxy) {
         helpText += `
-  /mai状态 [@用户] - 查询他人绑定状态（需要auth等级${authLevelForProxy}以上）`
+  /mai状态 [@用户] - 查询他人绑定状态（需要auth等级${authLevelForProxy}以上）
+  /mai地图 [@用户] - 查询他人游玩地区（需要auth等级${authLevelForProxy}以上）`
       }
 
       helpText += `
@@ -4605,15 +4608,11 @@ export function apply(ctx: Context, config: Config) {
           } else {
             try {
               const preview = await api.getPreview(machineInfo?.clientId ?? '', qrTextResult.qrText)
-              const chargeUserId = isNumericMaiUid(String(preview.UserID))
-                ? String(preview.UserID)
-                : (isNumericMaiUid(binding.maiUid) ? binding.maiUid : undefined)
               const chargeResult = await api.getCharge(
                 machineInfo.regionId,
                 machineInfo.clientId,
                 machineInfo.placeId,
                 qrTextResult.qrText,
-                chargeUserId ? { userId: chargeUserId } : undefined,
               )
               const cr = await applyPreviewToStatus(preview, chargeResult, qrTextResult.qrText)
               qrTextResultForCharge = { ...qrTextResult, chargeResult: cr }
@@ -4675,13 +4674,11 @@ export function apply(ctx: Context, config: Config) {
             if (qrTextResultForCharge.chargeResult) {
               chargeResult = qrTextResultForCharge.chargeResult
             } else if (qrTextResultForCharge.qrText) {
-              const chargeUserId = isNumericMaiUid(binding.maiUid) ? binding.maiUid : undefined
               chargeResult = await api.getCharge(
                 machineInfo.regionId,
                 machineInfo.clientId,
                 machineInfo.placeId,
                 qrTextResultForCharge.qrText,
-                chargeUserId ? { userId: chargeUserId } : undefined,
               )
             }
 
@@ -7088,6 +7085,95 @@ export function apply(ctx: Context, config: Config) {
   // 查询落雪B50任务状态功能已暂时取消
 
   if (!isPublicApi) {
+  /**
+   * 查询游玩地区地图
+   * 用法: /mai地图 或 /mai地图 <SGID或链接> 或 /mai地图 @用户
+   */
+  ctx.command('mai地图 [qrCodeOrTarget:text]', '查询账号游玩过的省份/地区')
+    .userFields(['authority'])
+    .action(async ({ session }, qrCodeOrTarget) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const whitelistCheck = checkWhitelist(session, config, isDebugSession(session))
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+
+      if (!machineInfo.clientId?.trim()) {
+        return '❌ 缺少 keychip 配置，请在插件 machineInfo.clientId 中填写机台 ID'
+      }
+
+      try {
+        let qrCode: string | undefined
+        let targetUserId: string | undefined
+        if (qrCodeOrTarget) {
+          const processed = processSGID(qrCodeOrTarget)
+          if (processed) {
+            await tryRecallMessage(session, ctx, config)
+            qrCode = processed.qrText
+          } else {
+            targetUserId = qrCodeOrTarget
+          }
+        }
+
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
+        }
+
+        const proxyTip = isProxy ? `（代操作用户 ${binding.userId}）` : ''
+
+        let qrTextResult: { qrText: string; error?: string; fromCache?: boolean }
+        if (qrCode) {
+          qrTextResult = await resolveInlineQrText(qrCode, binding, session)
+        } else {
+          qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        }
+        if (qrTextResult.error) {
+          return qrTextResult.error
+        }
+
+        const regionResult = await api.getUserRegion(machineInfo.clientId, qrTextResult.qrText)
+
+        if (isNumericMaiUid(binding.maiUid) && String(regionResult.userId) !== binding.maiUid) {
+          return (
+            `❌ 当前二维码与绑定账号不一致：\n` +
+            `• 绑定玩家：${formatBindingPlayerLabel(binding)}\n` +
+            `若您已更换游戏账号，请使用 /mai解绑 后重新绑定（换绑冷却期内请使用 /mai解绑卡）。`
+          )
+        }
+
+        let message =
+          `✅ ${formatBindingPlayerLabel(binding)} 的游玩地区${proxyTip}\n\n` +
+          `${formatUserRegionBlock(regionResult)}`
+
+        const refId = await logOperation({
+          command: 'mai地图',
+          session,
+          targetUserId,
+          status: 'success',
+          result: message,
+        })
+        return appendRefId(message, refId)
+      } catch (error: any) {
+        logger.error(`查询游玩地区失败: ${sanitizeError(error)}`)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        const errorMessage = `❌ 查询游玩地区失败: ${getSafeErrorMessage(error, session)}`
+        const refId = await logOperation({
+          command: 'mai地图',
+          session,
+          targetUserId: qrCodeOrTarget,
+          status: 'error',
+          errorMessage: getSafeErrorMessage(error, session),
+        })
+        return appendRefId(errorMessage, refId)
+      }
+    })
+
   /**
    * 查询选项文件（OPT）
    * 用法: /mai查询opt <title_ver>
